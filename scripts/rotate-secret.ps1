@@ -87,9 +87,8 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ""
 Write-Host "[rotate-secret] Secret 已更新。" -ForegroundColor Green
-Write-Host "请同步更新以下位置：" -ForegroundColor Green
-Write-Host "  1. 前端后端地址：https://<your-worker-domain>$path"
-Write-Host "  2. GitHub Actions Secret：SUB_STORE_PASSWORD_VALUE"
+Write-Host "请将以下地址配置到前端：" -ForegroundColor Green
+Write-Host "  https://<your-custom-domain>$path"
 Write-Host ""
 Write-Host "粘贴完成后，请清空剪贴板：" -ForegroundColor DarkYellow
 Write-Host "  Set-Clipboard -Value `$null"

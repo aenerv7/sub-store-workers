@@ -86,7 +86,7 @@ export default {
 
             // 路径前缀鉴权（可选）
             // 配置 SUB_STORE_FRONTEND_BACKEND_PATH = "/你的密码" 后
-            // 前端后端地址填: https://xxx.pages.dev/你的密码
+            // 前端后端地址填: https://你的自定义域名/你的密码
             // 管理 API 需要带前缀才能访问，分享链接（download/preview）不受影响
             const backendPath = env.SUB_STORE_FRONTEND_BACKEND_PATH;
             const isPublicPath = /^\/(api\/download|api\/preview|api\/sub\/flow)/.test(pathname);

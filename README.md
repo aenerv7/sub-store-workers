@@ -11,7 +11,7 @@ Sub-Store 后端的 Cloudflare Workers 移植版
 </p>
 
 <p align="center">
-<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/Yu9191/sub-store-workers">
+<a href="https://deploy.workers.cloudflare.com/?url=https://github.com/aenerv7/sub-store-workers">
 <img src="https://deploy.workers.cloudflare.com/button" alt="Deploy to Cloudflare">
 </a>
 <br><br>
@@ -26,7 +26,7 @@ Sub-Store 后端的 Cloudflare Workers 移植版
 
 ## 简介
 
-将 [Sub-Store](https://github.com/sub-store-org/Sub-Store) 后端部署到 Cloudflare Workers / Pages，无需服务器，免费使用。
+将 [Sub-Store](https://github.com/sub-store-org/Sub-Store) 后端部署到 Cloudflare Worker，无需服务器，免费使用。
 
 - **零服务器**：运行在 Cloudflare 边缘网络
 - **KV 持久化**：数据存储在 Cloudflare KV
@@ -68,12 +68,7 @@ esbuild.js                    ← 构建脚本，通过插件桥接两者
 
 ## 部署
 
-> 部署总览：**1.准备 → 2.上传 Workers/Pages → 3.设密码（必做）→ 4.连接前端**
->
-> 为什么两个都要部？`*.workers.dev` 在国内被 GFW 封锁，`*.pages.dev` 走 Cloudflare CDN 通常可直连。
->
-> - **有自定义域名**：只用 Workers 即可
-> - **无自定义域名**：Pages 对外提供 API，Workers 在后台跑 Cron。
+> 部署总览：**1.准备 → 2.上传 Worker → 3.设密码（必做）→ 4.手动绑定自定义域名 → 5.连接前端**
 
 ### 1. 克隆仓库
 
@@ -84,7 +79,7 @@ esbuild.js                    ← 构建脚本，通过插件桥接两者
 #   └── sub-store-workers/  ← 本项目
 
 git clone https://github.com/sub-store-org/Sub-Store.git
-git clone https://github.com/Yu9191/sub-store-workers.git
+git clone https://github.com/aenerv7/sub-store-workers.git
 
 cd sub-store-workers
 npm install
@@ -96,37 +91,19 @@ npm install
 npx wrangler login
 ```
 
-### 3. 创建 KV 命名空间
+### 3. 准备已有 KV 命名空间
 
-```bash
-npx wrangler kv namespace create SUB_STORE_DATA
-```
+本项目要求复用现有 Worker 使用的 `SUB_STORE_DATA` KV 命名空间。GitHub Actions 会从 `sub-store-backend` 的 Cloudflare 配置读取 namespace ID，不需要把 ID 写入仓库或新增 GitHub Secret。
 
-将返回的 `id` 填入 `wrangler.toml`：
-
-```toml
-[[kv_namespaces]]
-binding = "SUB_STORE_DATA"
-id = "你的KV命名空间ID"
-```
+本地手动部署时，可参考 [`wrangler.toml.example`](wrangler.toml.example) 填入该 namespace ID；CI 会自动从 Cloudflare 读取它。
 
 ### 4. 构建 & 部署
 
-**两者都需要部署：**
-
-| 部署方式 | 域名 | 用途 |
-|---|---|---|
-| **Workers** | `*.workers.dev` 或自定义域名 | API + Cron 定时同步 |
-| **Pages** | `*.pages.dev` | API（国内可直连） |
-
-> ⚠️ **执行下方部署命令前，请先确认已完成「1. 克隆仓库」「2. 登录 Cloudflare」「3. 创建 KV 命名空间」三步**，并完整阅读下文「5. 连接前端」「6. API 鉴权」两节。**部署完未设密码前 Worker 是公开的，任何人都能管理你的数据。**
+> ⚠️ **执行下方部署命令前，请先确认已完成「1. 克隆仓库」「2. 登录 Cloudflare」「3. 准备已有 KV」三步**，并完整阅读下文「5. 连接前端」「6. API 鉴权」两节。**部署完未设密码前 Worker 是公开的，任何人都能管理你的数据。**
 
 ```bash
-# Workers 部署（含 Cron Triggers）
+# Worker 部署（含 Cron Triggers）
 npm run deploy
-
-# Pages 部署（国内可用，一条命令）
-npm run deploy:pages
 ```
 
 > **强烈建议部署后立即设置鉴权密码**，否则任何人都能管理你的 Sub-Store 数据：
@@ -141,12 +118,7 @@ npm run deploy:pages
 >
 > 脚本会生成随机 URL-safe 密码，写入 Cloudflare Worker Secret，并复制到剪贴板。详细说明见下文“6. API 鉴权”。
 
-> Pages 部署完成后还需要在 Cloudflare Dashboard 中：
->
-> 1. 绑定 KV 命名空间 `SUB_STORE_DATA`
-> 2. 设置鉴权密码 Secret `SUB_STORE_FRONTEND_BACKEND_PATH`
->
-> 详细图文步骤见下文 [6. API 鉴权 → 方式 A.2 Pages 端](#6-api-鉴权强烈建议--已在第-4-步完成可跳过)。配置完成后必须再跑一次 `npm run deploy:pages` 让绑定生效。
+> 本仓库的 GitHub Actions 只部署 Worker `sub-store-backend`，不会创建或更新 Pages 项目，也不会配置 Custom Domain。请在 Cloudflare Dashboard 中手动绑定自定义域名。
 
 <details>
 <summary><b>自定义域名注意事项（如果你绑定了自有域名）</b></summary>
@@ -169,8 +141,7 @@ npm run deploy:pages
 例如：
 
 ```text
-https://sub-store-workers.your.workers.dev/aBc123XyZ
-https://sub-store.your.pages.dev/aBc123XyZ
+https://your-custom-domain.example/aBc123XyZ
 ```
 
 > 注意：**末尾的 `/密码` 不能省略**，否则 `/api/...` 会全部 401。
@@ -185,7 +156,7 @@ https://sub-store.your.pages.dev/aBc123XyZ
 
 > 默认 API 无密码保护。**不设密码任何人都能管理你的订阅**。第 4 步执行 `npm run rotate-secret` 已经设过的话，可以跳过本节。
 
-> 推荐使用 **Worker / Pages Secret**（加密存储）。**不要**写到 `wrangler.toml [vars]` 里——那里是明文，会随 commit 泄漏，并且 `wrangler deploy` 会用它覆盖同名 Secret，与下面的流程冲突。
+> 推荐使用 **Worker Secret**（加密存储）。**不要**写到 `wrangler.toml [vars]` 里——那里是明文，会随 commit 泄漏，并且 `wrangler deploy` 会用它覆盖同名 Secret，与下面的流程冲突。
 
 #### 方式 A（推荐）：使用 Cloudflare Secret
 
@@ -210,8 +181,7 @@ npm run rotate-secret:sh
 
 执行成功后，请同步更新：
 
-1. 前端后端地址：`https://xxx.workers.dev<剪贴板里的新密码>`
-2. 如果使用 GitHub Actions 自动部署，还要更新仓库 Secret（如 `SUB_STORE_PASSWORD_VALUE`）
+1. 前端后端地址：`https://你的自定义域名<剪贴板里的新密码>`
 
 > 用完后建议清空剪贴板：
 > - PowerShell：`Set-Clipboard -Value $null`
@@ -223,38 +193,6 @@ npm run rotate-secret:sh
 ```bash
 npx wrangler secret put SUB_STORE_FRONTEND_BACKEND_PATH
 ```
-
-##### A.2 Pages 端（在 Dashboard 配置）
-
-`wrangler.toml` 的 `[[kv_namespaces]]` 与 `[vars]` **只对 Workers 生效**。Pages 项目必须在 Cloudflare Dashboard 单独绑定 KV 与设置密码，否则 API 会因为缺少 KV 而 500，且任何人都可访问管理 API。
-
-**① 进入 Workers & Pages，点击 sub-store 项目**
-
-![进入项目](png/1.png)
-
-**② 进入 设置 → 绑定，点击 + 添加 KV 命名空间**
-
-![添加绑定](png/2.png)
-
-**③ 选择 KV 命名空间**
-
-![选择 KV](png/3.png)
-
-**④ 变量名填 `SUB_STORE_DATA`，选择对应 KV，保存**
-
-![保存绑定](png/4.png)
-
-**⑤ 进入 设置 → 变量和机密，点击 + 添加**
-
-![添加变量](png/5.png)
-
-**⑥ 变量名填 `SUB_STORE_FRONTEND_BACKEND_PATH`，值填 `/你的密码`（必须带 `/` 开头），类型选 Secret（加密），保存**
-
-![填写变量](png/6.png)
-
-> 保存后必须重新部署 `npm run deploy:pages` 才能生效。
-
-> Pages 不能跨项目共享 Worker Secret，建议把 Workers 与 Pages 的 `SUB_STORE_FRONTEND_BACKEND_PATH` 设为同一个值，方便前端切换。
 
 #### 方式 B（不推荐）：使用 `wrangler.toml [vars]` 明文变量
 
@@ -294,7 +232,7 @@ npm run dev
 SUB_STORE_PUSH_SERVICE = "https://api.day.app/你的BarkKey/[推送标题]/[推送内容]"
 ```
 
-Pages 需要在 Dashboard 手动添加同名环境变量。不支持 shoutrrr（命令行工具）。
+不支持 shoutrrr（命令行工具）。
 
 </details>
 
@@ -467,7 +405,7 @@ esbuild 构建时会从 `Sub-Store/backend/src/` 读取最新源码，重新 bui
 <details>
 <summary><b>GitHub Actions 自动同步上游（推荐）</b></summary>
 
-仓库内置了 `.github/workflows/sync-upstream.yml` 工作流，每天自动检测 Sub-Store 上游更新并部署。QuickJS Script Operator 默认启用，同时工作流会自动通过 Cloudflare API 为 Pages 项目设置 `SCRIPT_ENGINE` 环境变量，无需手动配置。
+仓库内置了 `.github/workflows/sync-upstream.yml` 工作流，每天自动检测 Sub-Store 上游更新并部署到名为 `sub-store-backend` 的 Worker。QuickJS Script Operator 默认启用。工作流会复用该 Worker 已有的 KV 绑定和 Secrets，不会部署 Pages，也不会配置 Custom Domain。
 
 #### 工作流程
 
@@ -478,11 +416,11 @@ esbuild 构建时会从 `Sub-Store/backend/src/` 读取最新源码，重新 bui
   ↓ 有更新
 安装依赖 → 运行上游测试套件
   ↓ 测试通过
-构建 → 部署 Workers → 部署 Pages → 健康检查
+构建 → 读取已有 KV 绑定 → 部署 Worker → 校验绑定和 Secret
   ↓ 全部成功
-记录已部署版本 + Bark 通知
+记录已部署版本
 
-任何环节失败 → Bark 通知"同步失败"，线上版本不受影响
+任何环节失败 → 不更新版本标记，线上版本不受影响
 ```
 
 #### 配置步骤
@@ -494,7 +432,6 @@ esbuild 构建时会从 `Sub-Store/backend/src/` 读取最新源码，重新 bui
 | 资源 | 权限 | 级别 |
 |---|---|---|
 | Account → Workers 脚本 | 编辑 | 你的账号 |
-| Account → Cloudflare Pages | 编辑 | 你的账号 |
 | Account → Workers KV 存储 | 编辑 | 你的账号 |
 | User → 用户详细信息 | 读取 | -- |
 
@@ -508,10 +445,6 @@ Account Resources 选择 **Include → 你的账号**。
 |---|---|---|
 | `CLOUDFLARE_API_TOKEN` | 上一步创建的 Token | Cloudflare 部署认证 |
 | `CLOUDFLARE_ACCOUNT_ID` | 你的 Account ID | Cloudflare Dashboard 首页右侧可见 |
-| `KV_NAMESPACE_ID` | KV 命名空间 ID | 创建 KV 时返回的 id |
-| `PAGES_PROJECT_NAME` | Pages 项目名 | 例如 `sub-store` |
-| `WORKERS_SUBDOMAIN` | Workers 子域名 | 例如 `sub-store2`（即 `*.sub-store2.workers.dev` 中的部分）|
-| `BARK_KEY` | Bark 推送 Key | 可选，用于成功/失败通知 |
 
 **3. 手动触发验证**
 
@@ -528,7 +461,7 @@ Account Resources 选择 **Include → 你的账号**。
 | **Cloudflare API 超时/限流** | 部署中断 | 下次自动重试 |
 | **API Token 过期或权限不足** | 部署失败 | 重新创建 Token 并更新 GitHub Secret |
 | **上游大版本重构**（目录结构变化） | 构建失败 | 需要手动更新 esbuild 配置 |
-| **健康检查失败** | Workers/Pages 已部署但版本标记不更新 | 手动检查线上是否正常 |
+| **绑定或 Secret 校验失败** | 不更新版本标记 | 确认 `sub-store-backend` 已存在并保留 `SUB_STORE_DATA` 和 `SUB_STORE_FRONTEND_BACKEND_PATH` |
 
 > **安全提示**：Cloudflare API Token 和 Account ID 请通过 GitHub Secrets 管理，**不要**写入任何文件或提交到仓库。
 
@@ -547,7 +480,7 @@ Account Resources 选择 **Include → 你的账号**。
 
 ### 功能
 
-- Workers / Pages 请求次数及占比
+- Workers 请求次数
 - KV 读写次数
 - Sub-Store 订阅数量、后端版本（可选）
 - 中英文切换

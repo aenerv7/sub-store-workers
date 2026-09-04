@@ -91,9 +91,8 @@ printf '%s' "$PATH_VALUE" | npx "${WRANGLER_ARGS[@]}"
 cat <<EOF
 
 [rotate-secret] Secret 已更新。
-请同步更新以下位置：
-  1. 前端后端地址：https://<your-worker-domain>${PATH_VALUE}
-  2. GitHub Actions Secret：SUB_STORE_PASSWORD_VALUE
+请将以下地址配置到前端：
+  https://<your-custom-domain>${PATH_VALUE}
 
 粘贴完成后请清空剪贴板，例如：
   unset CLIPBOARD || true

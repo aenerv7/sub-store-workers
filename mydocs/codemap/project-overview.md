@@ -47,7 +47,7 @@
 |---|---|
 | `esbuild.js` | **构建脚本**：4 个 esbuild 插件桥接 Workers 与上游源码；同时把上游 `createDynamicFunction` 替换为 QuickJS 沙箱执行（`SCRIPT_ENGINE=disabled` 可关闭） |
 | `wrangler.toml` | Workers 部署配置：KV 绑定、Cron、环境变量（路径密码推荐改用 Worker Secret） |
-| `package.json` | 依赖与脚本（`deploy`、`deploy:pages`、`rotate-secret`、`rotate-secret:sh`） |
+| `package.json` | 依赖与脚本（`build`、`deploy`、`rotate-secret`、`rotate-secret:sh`） |
 
 ### 3.3 运维脚本（`scripts/`）
 
@@ -174,6 +174,6 @@ createScriptFunction(script, name)
 3. **上游兼容性**：上游 Sub-Store 更新可能引入 Node-only API，需要构建时通过存根或适配处理
 4. **CPU 时限**：Workers 免费版 10ms CPU / 请求，复杂订阅处理可能超时
 5. **全局状态污染**：`globalThis.__workerEnv` 在并发请求间共享，理论上存在竞态
-6. **Pages 与 Workers 配置不互通**：`wrangler.toml` 的 `[vars]`/`[[kv_namespaces]]` 不影响 Pages 项目，需要在 Cloudflare Dashboard 单独绑定 KV 与设置 `SUB_STORE_FRONTEND_BACKEND_PATH`（建议设为 Pages Secret）。
+6. **Worker 部署配置**：`wrangler.toml` 的 `[vars]`/`[[kv_namespaces]]` 用于 Worker 部署；`SUB_STORE_FRONTEND_BACKEND_PATH` 应作为 Worker Secret 保存，自定义域名在 Cloudflare Dashboard 手动绑定。
 7. **`[vars]` 与 Worker Secret 同名冲突**：若同时存在，`wrangler deploy` 会用 `[vars]` 明文覆盖 Secret，破坏 CI Secret 管理流程；只用其中一种。
 8. **路径密码不可恢复**：Worker Secret 在 Dashboard 看不到原文，遗忘只能通过 `npm run rotate-secret` 重置。

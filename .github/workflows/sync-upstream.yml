@@ -10,6 +10,7 @@ on:
         description: '强制部署（即使无更新）'
         required: false
         default: 'false'
+        type: boolean
 
 concurrency:
   group: sync-upstream
@@ -17,6 +18,7 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  WORKER_NAME: sub-store-backend
 
 jobs:
   sync:
@@ -44,8 +46,8 @@ jobs:
         run: |
           SHA=$(git rev-parse HEAD)
           VERSION=$(node -p "require('./backend/package.json').version")
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Upstream: $VERSION ($SHA)"
 
       - name: Read last synced version
@@ -57,17 +59,19 @@ jobs:
           else
             LAST="none"
           fi
-          echo "sha=$LAST" >> $GITHUB_OUTPUT
+          echo "sha=$LAST" >> "$GITHUB_OUTPUT"
           echo "Last synced: $LAST"
 
       - name: Check if update needed
         id: check
+        env:
+          FORCE: ${{ inputs.force }}
         run: |
-          if [ "${{ steps.upstream.outputs.sha }}" = "${{ steps.last.outputs.sha }}" ] && [ "${{ inputs.force }}" != "true" ]; then
-            echo "needed=false" >> $GITHUB_OUTPUT
+          if [ "${{ steps.upstream.outputs.sha }}" = "${{ steps.last.outputs.sha }}" ] && [ "$FORCE" != "true" ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
             echo "No update needed"
           else
-            echo "needed=true" >> $GITHUB_OUTPUT
+            echo "needed=true" >> "$GITHUB_OUTPUT"
             echo "Update needed"
           fi
 
@@ -142,12 +146,11 @@ jobs:
           MB=$(awk "BEGIN {printf \"%.2f\", $BYTES/1024/1024}")
           GZIP_BYTES=$(gzip -c dist/worker.js | wc -c)
           GZIP_KB=$(awk "BEGIN {printf \"%.1f\", $GZIP_BYTES/1024}")
-          echo "bytes=$BYTES" >> $GITHUB_OUTPUT
-          echo "kb=$KB" >> $GITHUB_OUTPUT
-          echo "mb=$MB" >> $GITHUB_OUTPUT
-          echo "gzip_kb=$GZIP_KB" >> $GITHUB_OUTPUT
+          echo "bytes=$BYTES" >> "$GITHUB_OUTPUT"
+          echo "kb=$KB" >> "$GITHUB_OUTPUT"
+          echo "mb=$MB" >> "$GITHUB_OUTPUT"
+          echo "gzip_kb=$GZIP_KB" >> "$GITHUB_OUTPUT"
           echo "worker.js raw: ${KB} KB (${MB} MB), gzipped: ${GZIP_KB} KB"
-          # Workers 付费上限 10 MiB（gzipped），免费 3 MiB（gzipped）
           HARD_LIMIT=$((10 * 1024 * 1024))
           if [ "$GZIP_BYTES" -gt "$HARD_LIMIT" ]; then
             echo "::error::Worker bundle gzipped size ${GZIP_KB} KB exceeds Cloudflare 10 MiB hard limit"
@@ -158,19 +161,51 @@ jobs:
             echo "::warning::Worker bundle gzipped size ${GZIP_KB} KB exceeds Cloudflare free tier 3 MiB limit (paid plan required)"
           fi
 
-      - name: Generate wrangler.toml
+      - name: Resolve existing KV binding
+        if: steps.check.outputs.needed == 'true'
+        id: kv
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          API="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/settings"
+          RESPONSE=$(curl --fail-with-body -sS "$API" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json")
+          if ! jq -e '.success == true' >/dev/null <<<"$RESPONSE"; then
+            echo "Cloudflare did not return settings for ${WORKER_NAME}. The existing Worker must be present before migration."
+            jq -c '.errors // []' <<<"$RESPONSE"
+            exit 1
+          fi
+          KV_ID=$(jq -r '.result.bindings[]? | select(.type == "kv_namespace" and .name == "SUB_STORE_DATA") | .namespace_id' <<<"$RESPONSE" | head -n 1)
+          if [ -z "$KV_ID" ] || [ "$KV_ID" = "null" ]; then
+            echo "Existing Worker ${WORKER_NAME} has no SUB_STORE_DATA KV binding."
+            exit 1
+          fi
+          echo "namespace_id=$KV_ID" >> "$GITHUB_OUTPUT"
+          echo "Reusing existing SUB_STORE_DATA KV namespace"
+
+      - name: Generate Wrangler config
         if: steps.check.outputs.needed == 'true'
         working-directory: sub-store-workers
+        env:
+          KV_NAMESPACE_ID: ${{ steps.kv.outputs.namespace_id }}
         run: |
-          cat > wrangler.toml <<'TOML'
-          name = "sub-store-workers"
+          cat > wrangler.toml <<TOML
+          name = "sub-store-backend"
           main = "dist/worker.js"
-          compatibility_date = "2024-09-23"
+          compatibility_date = "2026-09-04"
           compatibility_flags = ["nodejs_compat"]
+          workers_dev = false
+          keep_vars = true
+
+          [secrets]
+          required = ["SUB_STORE_FRONTEND_BACKEND_PATH"]
 
           [[kv_namespaces]]
           binding = "SUB_STORE_DATA"
-          id = "__KV_ID__"
+          id = "${KV_NAMESPACE_ID}"
 
           [triggers]
           crons = ["55 15 * * *"]
@@ -180,12 +215,9 @@ jobs:
           SUB_STORE_BACKEND_CUSTOM_NAME = "Workers"
           SUB_STORE_BACKEND_CUSTOM_ICON = "https://cdn.jsdelivr.net/gh/Yu9191/sub-store-workers@main/png/cloudflare.png"
           TOML
-          sed -i 's/^          //' wrangler.toml
-          sed -i "s/__KV_ID__/${{ secrets.KV_NAMESPACE_ID }}/" wrangler.toml
-          echo "Generated wrangler.toml:"
-          cat wrangler.toml
+          echo "Generated Wrangler config for ${WORKER_NAME} with the existing KV binding"
 
-      - name: Deploy Workers
+      - name: Deploy Worker
         if: steps.check.outputs.needed == 'true'
         working-directory: sub-store-workers
         env:
@@ -193,91 +225,42 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npx wrangler deploy
 
-      - name: Prepare Pages bundle
-        if: steps.check.outputs.needed == 'true'
-        working-directory: sub-store-workers
-        run: |
-          mkdir -p pages-dist
-          cp dist/worker.js pages-dist/_worker.js
-          cp dist/quickjs.wasm pages-dist/quickjs.wasm
-
-      - name: Deploy Pages
+      - name: Verify Worker bindings and secrets
         if: steps.check.outputs.needed == 'true'
         working-directory: sub-store-workers
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          npx wrangler pages deploy pages-dist \
-            --project-name "${{ secrets.PAGES_PROJECT_NAME }}" \
-            --branch main \
-            --commit-message "upstream ${{ steps.upstream.outputs.version }}" \
-            --commit-dirty=true
-
-      - name: Set Pages environment variables
-        if: steps.check.outputs.needed == 'true'
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          PAGES_PROJECT_NAME: ${{ secrets.PAGES_PROJECT_NAME }}
-        run: |
-          echo "Setting SCRIPT_ENGINE=quickjs for Pages project: ${PAGES_PROJECT_NAME}"
-          RESP=$(curl -s -X PATCH \
-            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${PAGES_PROJECT_NAME}" \
+          set -euo pipefail
+          API="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/settings"
+          RESPONSE=$(curl --fail-with-body -sS "$API" \
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "deployment_configs": {
-                "production": {
-                  "env_vars": {
-                    "SCRIPT_ENGINE": {
-                      "value": "quickjs",
-                      "type": "plain_text"
-                    }
-                  }
-                }
-              }
-            }')
-          SUCCESS=$(echo "$RESP" | jq -r '.success // false')
-          if [ "$SUCCESS" = "true" ]; then
-            echo "Pages environment variables set successfully"
-          else
-            echo "::warning::Failed to set Pages environment variables: $(echo "$RESP" | jq -r '.errors // []')"
-          fi
+            -H "Content-Type: application/json")
+          jq -e '.success == true' >/dev/null <<<"$RESPONSE"
+          jq -e '.result.bindings[]? | select(.type == "kv_namespace" and .name == "SUB_STORE_DATA")' >/dev/null <<<"$RESPONSE"
+          echo "Worker ${WORKER_NAME} is deployed with SUB_STORE_DATA"
 
-      - name: Health check
-        if: steps.check.outputs.needed == 'true'
-        run: |
-          URL="https://sub-store-workers.${{ secrets.WORKERS_SUBDOMAIN }}.workers.dev"
-          for i in 1 2 3; do
-            sleep 10
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL/")
-            echo "Attempt $i: HTTP $CODE"
-            if [ "$CODE" = "200" ] || [ "$CODE" = "302" ] || [ "$CODE" = "404" ]; then
-              echo "Worker is alive"
-              exit 0
-            fi
-          done
-          echo "Worker health check failed"
-          exit 1
+          SECRETS=$(npx wrangler secret list)
+          jq -e 'any(.[]; .name == "SUB_STORE_FRONTEND_BACKEND_PATH")' >/dev/null <<<"$SECRETS"
+          echo "Existing Worker Secrets are preserved; SUB_STORE_FRONTEND_BACKEND_PATH is present"
 
       - name: Write job summary
         if: always() && steps.check.outputs.needed == 'true'
         run: |
           {
-            echo "## Sub-Store Workers 同步结果"
+            echo "## Sub-Store Worker 同步结果"
             echo ""
             echo "| 项目 | 值 |"
             echo "| --- | --- |"
+            echo "| Worker | \`${WORKER_NAME}\` |"
             echo "| 上游版本 | \`${{ steps.upstream.outputs.version }}\` |"
             echo "| 上游 SHA | \`${{ steps.upstream.outputs.sha }}\` |"
             echo "| 上次同步 SHA | \`${{ steps.last.outputs.sha }}\` |"
             echo "| Worker 原始大小 | ${{ steps.size.outputs.kb }} KB (${{ steps.size.outputs.mb }} MB) |"
             echo "| Worker gzip 大小 | ${{ steps.size.outputs.gzip_kb }} KB |"
-            echo ""
-            if [ "${{ steps.last.outputs.sha }}" != "none" ] && [ "${{ steps.last.outputs.sha }}" != "${{ steps.upstream.outputs.sha }}" ]; then
-              echo "**上游 diff**: https://github.com/sub-store-org/Sub-Store/compare/${{ steps.last.outputs.sha }}...${{ steps.upstream.outputs.sha }}"
-            fi
+            echo "| Pages | 未部署 |"
+            echo "| Custom Domain | 未配置（请在 Cloudflare Dashboard 手动绑定） |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Update upstream-sha marker
@@ -289,24 +272,4 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .upstream-sha
           git commit -m "chore: sync upstream to ${{ steps.upstream.outputs.version }} [skip ci]" || exit 0
-          git push
-
-      - name: Bark notify success
-        if: steps.check.outputs.needed == 'true' && success() && env.BARK_KEY != ''
-        env:
-          BARK_KEY: ${{ secrets.BARK_KEY }}
-        run: |
-          TITLE=$(printf 'Sub-Store %%E5%%B7%%B2%%E6%%9B%%B4%%E6%%96%%B0' | sed 's/%%/%/g')
-          curl -s "https://api.day.app/${BARK_KEY}/Sub-Store%20${{ steps.upstream.outputs.version }}/Workers%20%2B%20Pages%20deployed"
-
-      - name: Bark notify failure
-        if: failure() && env.BARK_KEY != ''
-        env:
-          BARK_KEY: ${{ secrets.BARK_KEY }}
-          UPSTREAM_VERSION: ${{ steps.upstream.outputs.version }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          VER="${UPSTREAM_VERSION:-unknown}"
-          TITLE="Sub-Store%20Sync%20Failed%20${VER}"
-          BODY=$(printf '%s' "${RUN_URL}" | sed 's/:/%3A/g; s|/|%2F|g')
-          curl -s "https://api.day.app/${BARK_KEY}/${TITLE}/${BODY}"
+          git push origin HEAD:main
