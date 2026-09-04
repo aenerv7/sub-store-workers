@@ -208,7 +208,7 @@ jobs:
           id = "${KV_NAMESPACE_ID}"
 
           [triggers]
-          crons = ["55 15 * * *"]
+          crons = ["0 21 * * *"]
 
           [vars]
           SCRIPT_ENGINE = "quickjs"

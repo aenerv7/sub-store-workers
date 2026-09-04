@@ -14,9 +14,9 @@ required = ["SUB_STORE_FRONTEND_BACKEND_PATH"]
 binding = "SUB_STORE_DATA"
 id = "你的KV命名空间ID"
 
-# 定时同步（每天 23:55 执行）
+# 定时同步（每天北京时间 05:00 执行）
 [triggers]
-crons = ["55 15 * * *"]
+crons = ["0 21 * * *"]
 
 [vars]
 # SUB_STORE_FRONTEND_BACKEND_PATH = "/你的密码"

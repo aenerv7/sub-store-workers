@@ -49,7 +49,7 @@ Sub-Store 前端
 Cloudflare Worker: sub-store-backend
       ├── KV binding: SUB_STORE_DATA
       ├── Worker Secret: SUB_STORE_FRONTEND_BACKEND_PATH
-      └── Cron Trigger: 每天 23:55（北京时间）同步 artifacts
+      └── Cron Trigger: 每天 05:00（北京时间）同步 artifacts
 ```
 
 GitHub Actions 的实际流程：
