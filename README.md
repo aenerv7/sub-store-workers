@@ -38,7 +38,7 @@ parent/
 └── sub-store-workers/       本 Fork
 ```
 
-GitHub Actions 会临时 checkout 上游 `sub-store-org/Sub-Store`，不会使用 Dox 子模块，也不会把上游源码复制进本 Fork。上游更新后，Actions 会重新测试、构建并部署；Workers 适配问题只在本 Fork 的 `src/` 和 `esbuild.js` 中维护。
+GitHub Actions 会临时 checkout 上游 `sub-store-org/Sub-Store`，不会把上游源码复制进本 Fork。上游更新后，Actions 会重新测试、构建并部署；Workers 适配问题只在本 Fork 的 `src/` 和 `esbuild.js` 中维护。
 
 ## 实际落地架构
 
