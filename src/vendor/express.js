@@ -5,7 +5,6 @@ import { ENV } from './open-api';
 export default function express({ substore: $ }) {
     const DEFAULT_HEADERS = {
         'Content-Type': 'text/plain;charset=UTF-8',
-        'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'POST,GET,OPTIONS,PATCH,PUT,DELETE',
         'Access-Control-Allow-Headers':
             'Origin, X-Requested-With, Content-Type, Accept',
@@ -64,7 +63,7 @@ export default function express({ substore: $ }) {
 
         const url = new URL(request.url);
         const method = request.method.toUpperCase();
-        const path = decodeURIComponent(url.pathname);
+        const path = url.pathname;
         const query = {};
         url.searchParams.forEach((value, key) => {
             query[key] = value;
@@ -279,47 +278,43 @@ export default function express({ substore: $ }) {
 // ---- 工具函数 ----
 
 function patternMatched(pattern, path) {
-    if (pattern instanceof RegExp && pattern.test(path)) {
-        return true;
-    } else {
-        if (pattern === '/') return true;
-        if (pattern.indexOf(':') === -1) {
-            const spath = path.split('/');
-            const spattern = pattern.split('/');
-            for (let i = 0; i < spattern.length; i++) {
-                if (spath[i] !== spattern[i]) {
-                    return false;
-                }
-            }
-            return true;
-        } else if (extractPathParams(pattern, path)) {
-            return true;
-        }
+    if (pattern instanceof RegExp) {
+        pattern.lastIndex = 0;
+        return pattern.test(path);
     }
-    return false;
+    if (typeof pattern !== 'string') return false;
+    if (pattern.indexOf(':') !== -1) {
+        return extractPathParams(pattern, path) !== null;
+    }
+    return normalizeRoutePath(pattern) === normalizeRoutePath(path);
 }
 
 function extractPathParams(pattern, path) {
     if (typeof pattern !== 'string' || pattern.indexOf(':') === -1) {
         return null;
     }
+    const patternSegments = normalizeRoutePath(pattern).split('/');
+    const pathSegments = normalizeRoutePath(path).split('/');
+    if (patternSegments.length !== pathSegments.length) return null;
+
     const params = {};
-    for (let i = 0, j = 0; i < pattern.length; i++, j++) {
-        if (pattern[i] === ':') {
-            let key = [];
-            let val = [];
-            while (pattern[++i] !== '/' && i < pattern.length) {
-                key.push(pattern[i]);
-            }
-            while (path[j] !== '/' && j < path.length) {
-                val.push(path[j++]);
-            }
-            params[key.join('')] = decodeURIComponent(val.join(''));
-        } else {
-            if (pattern[i] !== path[j]) {
+    for (let i = 0; i < patternSegments.length; i++) {
+        const expected = patternSegments[i];
+        const actual = pathSegments[i];
+        if (expected.startsWith(':')) {
+            if (!actual) return null;
+            try {
+                params[expected.slice(1)] = decodeURIComponent(actual);
+            } catch {
                 return null;
             }
+        } else if (expected !== actual) {
+            return null;
         }
     }
     return params;
+}
+
+function normalizeRoutePath(path) {
+    return path.length > 1 ? path.replace(/\/+$/, '') : path;
 }

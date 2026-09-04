@@ -6,6 +6,22 @@ const fs = require('fs');
 // 路径配置
 const WORKERS_SRC = path.resolve(__dirname, 'src');
 const ORIGINAL_SRC = path.resolve(__dirname, '..', 'Sub-Store', 'backend', 'src');
+const OUTPUT_FILE = path.join(__dirname, 'dist', 'worker.js');
+const rewriteCounts = {
+    evalRequire: 0,
+    evalProcessEnv: 0,
+    dynamicFunction: 0,
+};
+
+function countMatches(source, regexp) {
+    const flags = regexp.flags.includes('g') ? regexp.flags : `${regexp.flags}g`;
+    return [...source.matchAll(new RegExp(regexp.source, flags))].length;
+}
+
+function replaceTracked(source, regexp, replacement, counter) {
+    rewriteCounts[counter] += countMatches(source, regexp);
+    return source.replace(regexp, replacement);
+}
 
 /** 插件：路径别名解析 */
 function resolveFile(basePath) {
@@ -63,15 +79,19 @@ const evalRewritePlugin = {
             let contents = original;
 
             // eval(require) → require
-            contents = contents.replace(
+            contents = replaceTracked(
+                contents,
                 /eval\((['"`])(require\((['"`])(.+?)\3\))\1\)/g,
                 '$2',
+                'evalRequire',
             );
 
             // eval(process.env) → globalThis
-            contents = contents.replace(
+            contents = replaceTracked(
+                contents,
                 /eval\((['"`])process\.env\.(\w+)\1\)/g,
                 '(globalThis.__workerEnv?.$2)',
+                'evalProcessEnv',
             );
 
             // eval(process.version)
@@ -111,7 +131,8 @@ const evalRewritePlugin = {
             );
 
             if (args.path.endsWith(path.join('core', 'proxy-utils', 'processors', 'index.js'))) {
-                contents = contents.replace(
+                contents = replaceTracked(
+                    contents,
                     /function createDynamicFunction\(name, script, \$arguments, \$options\) \{[\s\S]*?\n\}/,
                     `function createDynamicFunction(name, script, $arguments, $options) {
     const engine = globalThis.__workerEnv?.SCRIPT_ENGINE;
@@ -121,6 +142,7 @@ const evalRewritePlugin = {
     const { createScriptFunction } = require('@/vendor/quickjs-executor');
     return createScriptFunction(script, name, $arguments, $options);
 }`,
+                    'dynamicFunction',
                 );
             }
 
@@ -132,6 +154,40 @@ const evalRewritePlugin = {
             }
 
             return null;
+        });
+    },
+};
+
+const buildValidationPlugin = {
+    name: 'build-validation',
+    setup(build) {
+        build.onEnd((result) => {
+            if (result.errors.length > 0) return;
+            const expected = {
+                evalRequire: { minimum: 1, label: 'eval(require) rewrites' },
+                evalProcessEnv: { minimum: 1, label: 'eval(process.env.*) rewrites' },
+                dynamicFunction: { exact: 1, label: 'createDynamicFunction rewrite' },
+            };
+            for (const [key, rule] of Object.entries(expected)) {
+                const count = rewriteCounts[key];
+                if (
+                    (rule.minimum !== undefined && count < rule.minimum) ||
+                    (rule.exact !== undefined && count !== rule.exact)
+                ) {
+                    throw new Error(
+                        `[build-validation] ${rule.label} matched ${count} time(s); upstream source changed`,
+                    );
+                }
+            }
+
+            const bundle = fs.readFileSync(OUTPUT_FILE, 'utf8');
+            const forbiddenRuntimeCode = /\beval\s*\(|\bnew\s+Function\s*\(/;
+            if (forbiddenRuntimeCode.test(bundle)) {
+                throw new Error(
+                    '[build-validation] Worker bundle still contains eval() or new Function()',
+                );
+            }
+            console.log(`[build-validation] rewrite counts: ${JSON.stringify(rewriteCounts)}`);
         });
     },
 };
@@ -277,8 +333,14 @@ const nodeStubPlugin = {
         platform: 'browser', // Workers 运行时
         format: 'esm',
         target: 'es2022',
-        outfile: path.join(__dirname, 'dist', 'worker.js'),
-        plugins: [aliasPlugin, peggyPrecompilePlugin, evalRewritePlugin, nodeStubPlugin],
+        outfile: OUTPUT_FILE,
+        plugins: [
+            aliasPlugin,
+            peggyPrecompilePlugin,
+            evalRewritePlugin,
+            nodeStubPlugin,
+            buildValidationPlugin,
+        ],
         loader: {
             '.wasm': 'copy',
         },
@@ -286,7 +348,7 @@ const nodeStubPlugin = {
         define: {
             'process.env.NODE_ENV': '"production"',
         },
-        external: [],
+        external: ['cloudflare:workers'],
         nodePaths: [path.resolve(__dirname, 'node_modules')],
         // Workers 包体积限制
         logLevel: 'info',

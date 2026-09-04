@@ -1,0 +1,13 @@
+Sub-Store Workers is a Cloudflare Workers adaptation of Sub-Store.
+
+The upstream Sub-Store source is obtained at build time from:
+https://github.com/sub-store-org/Sub-Store
+
+This repository modifies the runtime boundary only: Cloudflare Worker
+entrypoint and routing, Durable Object/KV persistence, QuickJS integration,
+and build/deployment automation. Upstream business logic is not maintained
+here. The deployed source corresponds to the upstream commit recorded in
+`.upstream-sha` at build time.
+
+Copyright and license notices for upstream code remain under GNU AGPLv3;
+see LICENSE.

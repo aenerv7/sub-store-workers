@@ -35,7 +35,7 @@ function deleteToken(req, res) {
                 `Payload type and name are required. Please update your front-end(version >= 2.15.76)`,
             );
         }
-        $.info(`正在删除...\ntoken: ${token}, 类型：${type}, 名称：${name}`);
+        $.info(`正在删除分享 token...\n类型：${type}, 名称：${name}`);
         if (shouldArchiveDeletion(req.query.mode)) {
             archiveShare(token, type, name);
         }
@@ -212,8 +212,7 @@ function createTokenItem(payload, options = {}) {
                 `Invalid custom token: ${token}`,
             );
         }
-        // Workers 幂等更新：KV cacheTtl 可能导致前端 DELETE+POST 读到旧数据
-        // 遇到重复 token 时先删除旧的，再创建新的（而非报错）
+        // Workers 幂等更新：遇到重复 token 时先删除旧值再创建。
         const tokens = $.read(TOKENS_KEY) || [];
         const existingIndex = tokens.findIndex(
             (item) =>

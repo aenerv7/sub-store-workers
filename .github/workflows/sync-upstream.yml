@@ -136,29 +136,39 @@ jobs:
         working-directory: sub-store-workers
         run: npm run build
 
+      - name: Run Worker runtime tests
+        if: steps.check.outputs.needed == 'true'
+        working-directory: sub-store-workers
+        run: npx vitest run
+
       - name: Check worker bundle size
         if: steps.check.outputs.needed == 'true'
         id: size
         working-directory: sub-store-workers
         run: |
-          BYTES=$(stat -c %s dist/worker.js)
+          FILES=(dist/worker.js dist/quickjs.wasm)
+          BYTES=0
+          GZIP_BYTES=0
+          for FILE in "${FILES[@]}"; do
+            if [ ! -f "$FILE" ]; then
+              echo "::error::Expected Worker upload module is missing: $FILE"
+              exit 1
+            fi
+            BYTES=$((BYTES + $(stat -c %s "$FILE")))
+            GZIP_BYTES=$((GZIP_BYTES + $(gzip -c "$FILE" | wc -c)))
+          done
           KB=$(awk "BEGIN {printf \"%.1f\", $BYTES/1024}")
           MB=$(awk "BEGIN {printf \"%.2f\", $BYTES/1024/1024}")
-          GZIP_BYTES=$(gzip -c dist/worker.js | wc -c)
           GZIP_KB=$(awk "BEGIN {printf \"%.1f\", $GZIP_BYTES/1024}")
           echo "bytes=$BYTES" >> "$GITHUB_OUTPUT"
           echo "kb=$KB" >> "$GITHUB_OUTPUT"
           echo "mb=$MB" >> "$GITHUB_OUTPUT"
           echo "gzip_kb=$GZIP_KB" >> "$GITHUB_OUTPUT"
-          echo "worker.js raw: ${KB} KB (${MB} MB), gzipped: ${GZIP_KB} KB"
-          HARD_LIMIT=$((10 * 1024 * 1024))
-          if [ "$GZIP_BYTES" -gt "$HARD_LIMIT" ]; then
-            echo "::error::Worker bundle gzipped size ${GZIP_KB} KB exceeds Cloudflare 10 MiB hard limit"
-            exit 1
-          fi
+          echo "Worker upload raw: ${KB} KB (${MB} MB), compressed upper bound: ${GZIP_KB} KB"
           FREE_LIMIT=$((3 * 1024 * 1024))
           if [ "$GZIP_BYTES" -gt "$FREE_LIMIT" ]; then
-            echo "::warning::Worker bundle gzipped size ${GZIP_KB} KB exceeds Cloudflare free tier 3 MiB limit (paid plan required)"
+            echo "::error::Worker upload compressed size ${GZIP_KB} KB exceeds the Workers Free 3 MiB limit"
+            exit 1
           fi
 
       - name: Resolve existing KV binding
@@ -213,7 +223,18 @@ jobs:
           [vars]
           SCRIPT_ENGINE = "quickjs"
           SUB_STORE_BACKEND_CUSTOM_NAME = "Workers"
-          SUB_STORE_BACKEND_CUSTOM_ICON = "https://cdn.jsdelivr.net/gh/Yu9191/sub-store-workers@main/png/cloudflare.png"
+          SUB_STORE_BACKEND_CUSTOM_ICON = "https://cdn.jsdelivr.net/gh/aenerv7/sub-store-workers@main/png/cloudflare.png"
+
+          [observability]
+          enabled = true
+
+          [[durable_objects.bindings]]
+          name = "SUB_STORE_COORDINATOR"
+          class_name = "SubStoreCoordinator"
+
+          [[migrations]]
+          tag = "v1"
+          new_sqlite_classes = ["SubStoreCoordinator"]
           TOML
           echo "Generated Wrangler config for ${WORKER_NAME} with the existing KV binding"
 
@@ -223,9 +244,33 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: npx wrangler deploy
+        run: |
+          set -euo pipefail
+          PREVIOUS=$(npx wrangler deployments list --name "$WORKER_NAME" --json | jq -r '((max_by(.created_on) // {}) | ([.versions[]?] | max_by(.percentage).version_id)) // empty')
+          if [ -n "$PREVIOUS" ]; then
+            printf '%s\n' "$PREVIOUS" > /tmp/previous-worker-version
+          else
+            rm -f /tmp/previous-worker-version
+          fi
+          npx wrangler deploy --keep-vars
 
-      - name: Verify Worker bindings and secrets
+      - name: Verify Worker HTTP health
+        if: steps.check.outputs.needed == 'true'
+        working-directory: sub-store-workers
+        env:
+          WORKER_HEALTH_URL: ${{ secrets.WORKER_HEALTH_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WORKER_HEALTH_URL:-}" ]; then
+            echo "WORKER_HEALTH_URL is not configured; skipping external HTTP health check"
+            exit 0
+          fi
+          RESPONSE=$(curl --fail-with-body -sS --max-time 20 -D /tmp/worker-headers "$WORKER_HEALTH_URL/_health")
+          STATUS=$(awk 'NR==1 {print $2}' /tmp/worker-headers)
+          test "$STATUS" = "200"
+          jq -e '.status == "ok" and .storage == "durable-object"' <<<"$RESPONSE"
+
+      - name: Verify Worker bindings, Durable Object and secrets
         if: steps.check.outputs.needed == 'true'
         working-directory: sub-store-workers
         env:
@@ -239,11 +284,31 @@ jobs:
             -H "Content-Type: application/json")
           jq -e '.success == true' >/dev/null <<<"$RESPONSE"
           jq -e '.result.bindings[]? | select(.type == "kv_namespace" and .name == "SUB_STORE_DATA")' >/dev/null <<<"$RESPONSE"
+          jq -e '.result.bindings[]? | select(.type == "durable_object_namespace" and .name == "SUB_STORE_COORDINATOR")' >/dev/null <<<"$RESPONSE"
           echo "Worker ${WORKER_NAME} is deployed with SUB_STORE_DATA"
 
           SECRETS=$(npx wrangler secret list)
           jq -e 'any(.[]; .name == "SUB_STORE_FRONTEND_BACKEND_PATH")' >/dev/null <<<"$SECRETS"
           echo "Existing Worker Secrets are preserved; SUB_STORE_FRONTEND_BACKEND_PATH is present"
+
+      - name: Roll back failed deployment
+        if: failure() && steps.check.outputs.needed == 'true'
+        working-directory: sub-store-workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ ! -s /tmp/previous-worker-version ]; then
+            echo "No previous Worker version was recorded; rollback skipped"
+            exit 0
+          fi
+          PREVIOUS=$(cat /tmp/previous-worker-version)
+          if [ -z "$PREVIOUS" ]; then
+            echo "Previous Worker version is empty; rollback skipped"
+            exit 0
+          fi
+          npx wrangler rollback "$PREVIOUS" --name "$WORKER_NAME" --message "Automated rollback after failed verification" --yes
 
       - name: Write job summary
         if: always() && steps.check.outputs.needed == 'true'
@@ -264,7 +329,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Update upstream-sha marker
-        if: steps.check.outputs.needed == 'true'
+        if: success() && steps.check.outputs.needed == 'true'
         working-directory: sub-store-workers
         run: |
           echo "${{ steps.upstream.outputs.sha }}" > .upstream-sha

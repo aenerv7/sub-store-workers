@@ -1,17 +1,19 @@
 # Sub-Store Workers
 
-将 [Sub-Store](https://github.com/sub-store-org/Sub-Store) 后端运行在 Cloudflare Workers 上的适配 Fork。
+将 [Sub-Store](https://github.com/sub-store-org/Sub-Store) 后端运行在 Cloudflare Workers 上的独立适配项目。
 
-本仓库面向已经使用 Cloudflare 的部署方式：Worker 名称固定为 `sub-store-backend`，数据使用已有的 Cloudflare KV，鉴权使用已有的 Worker Secret，Custom Domain 在 Cloudflare Dashboard 中手动绑定。
+本仓库面向已经使用 Cloudflare 的部署方式：Worker 名称固定为 `sub-store-backend`，现有 KV 作为迁移源和镜像备份，Durable Object 负责强一致状态，鉴权使用已有的 Worker Secret，Custom Domain 在 Cloudflare Dashboard 中手动绑定。
+
+本项目以 **Workers Free 可部署** 为硬约束：Durable Object 必须使用免费计划支持的 SQLite 后端，不引入 Workers Paid 专属资源；CI 会在上传包超过 Free 计划的 3 MiB 压缩大小限制时停止部署。Cloudflare 免费额度耗尽时请求会失败而不是自动计费，只有主动将账号升级到 Workers Paid 才会产生 Workers 月费。
 
 ## 这是什么
 
-上游 [Sub-Store](https://github.com/sub-store-org/Sub-Store) 是完整的 Node.js 后端，通常通过 Node.js、pnpm、Docker 或 VPS 运行。本 Fork 不复制上游业务代码，也不是 Pages 项目，而是提供 Cloudflare Workers 运行所需的平台适配层。
+上游 [Sub-Store](https://github.com/sub-store-org/Sub-Store) 是完整的 Node.js 后端，通常通过 Node.js、pnpm、Docker 或 VPS 运行。本项目不复制上游业务代码，也不是 Pages 项目，而是提供 Cloudflare Workers 运行所需的平台适配层。
 
-| 项目 | 上游 Sub-Store | 本 Fork |
+| 项目 | 上游 Sub-Store | 本项目 |
 | --- | --- | --- |
 | 运行时 | Node.js / Express | Cloudflare Workers / Fetch |
-| 持久化 | 本地文件系统 | Cloudflare KV，绑定名 `SUB_STORE_DATA` |
+| 持久化 | 本地文件系统 | Durable Object 强一致存储，KV `SUB_STORE_DATA` 用于迁移和镜像 |
 | 动态脚本 | Node.js `eval` / `new Function` | QuickJS WASM 沙箱，默认启用 |
 | 构建 | 上游自己的 pnpm 构建流程 | `esbuild.js` 将 Workers 适配层与上游源码打包 |
 | 部署 | 手动部署 Node.js 服务 | GitHub Actions 部署 Worker `sub-store-backend` |
@@ -23,7 +25,7 @@
 ## 目录和同步边界
 
 ```text
-src/                         Cloudflare Workers 适配层，本 Fork 维护
+src/                         Cloudflare Workers 适配层，本项目维护
 esbuild.js                   Workers + 上游源码的构建桥接
 wrangler.toml.example        本地部署配置示例
 .github/workflows/            自动同步上游并部署 Worker
@@ -35,10 +37,10 @@ scripts/rotate-secret.*      Worker Secret 密码轮换脚本
 ```text
 parent/
 ├── Sub-Store/               上游仓库，仅用于构建时引入
-└── sub-store-workers/       本 Fork
+└── sub-store-workers/       本项目
 ```
 
-GitHub Actions 会临时 checkout 上游 `sub-store-org/Sub-Store`，不会把上游源码复制进本 Fork。上游更新后，Actions 会重新测试、构建并部署；Workers 适配问题只在本 Fork 的 `src/` 和 `esbuild.js` 中维护。
+GitHub Actions 会临时 checkout 上游 `sub-store-org/Sub-Store`，不会把上游源码复制进本项目。上游更新后，Actions 会重新测试、构建并部署；Workers 适配问题只在本项目的 `src/` 和 `esbuild.js` 中维护。
 
 ## 实际落地架构
 
@@ -47,7 +49,8 @@ Sub-Store 前端
       │  https://你的域名/你的路径密码
       ▼
 Cloudflare Worker: sub-store-backend
-      ├── KV binding: SUB_STORE_DATA
+      ├── Durable Object binding: SUB_STORE_COORDINATOR
+      ├── KV binding: SUB_STORE_DATA（迁移/镜像）
       ├── Worker Secret: SUB_STORE_FRONTEND_BACKEND_PATH
       └── Cron Trigger: 每天 05:00（北京时间）同步 artifacts
 ```
@@ -55,8 +58,9 @@ Cloudflare Worker: sub-store-backend
 GitHub Actions 的实际流程：
 
 ```text
-拉取上游 → 上游测试 → 构建 Worker → 读取现有 KV 绑定
-       → 部署 sub-store-backend → 校验 KV 和 Secret → 回写上游版本标记
+拉取上游 → 上游测试 → 构建 Worker → Workers 运行时测试
+       → 读取现有 KV 绑定 → 部署 Worker/ Durable Object
+       → 健康检查和绑定校验 → 回写上游版本标记
 ```
 
 Actions 只部署 Worker。它不会创建 Pages、部署 Pages、读取 Secret 明文或配置 Custom Domain。
@@ -69,15 +73,16 @@ Actions 只部署 Worker。它不会创建 Pages、部署 Pages、读取 Secret 
 
 - Worker：`sub-store-backend`
 - KV 绑定：Worker 绑定名为 `SUB_STORE_DATA`，指向需要复用的现有 KV namespace
+- Durable Object：由首次部署的 `SubStoreCoordinator` 类和 `v1` migration 创建
 - Worker Secret：`SUB_STORE_FRONTEND_BACKEND_PATH`
 
 工作流会从 `sub-store-backend` 的 Worker settings 读取 `SUB_STORE_DATA` 的 namespace ID，并用 `keep_vars = true` 保留 Dashboard 中已有的变量。Worker Secret 不会被覆盖，工作流只校验它存在。
 
-如果 Worker 或上述绑定尚不存在，工作流会停止，不会替你创建新的 KV 或猜测 Secret 值。
+如果 Worker 或上述绑定尚不存在，工作流会停止，不会替你创建新的 KV 或猜测 Secret 值。可选地添加 `WORKER_HEALTH_URL` Actions Secret（值为 Custom Domain，例如 `https://sub.example.com`），工作流会在发布后请求 `/_health`；未配置时只执行 Cloudflare API 层面的绑定校验。
 
 ### 2. GitHub Actions Secrets
 
-在 Fork 的 `Settings → Secrets and variables → Actions` 中添加：
+在仓库的 `Settings → Secrets and variables → Actions` 中添加：
 
 | Secret | 用途 |
 | --- | --- |
@@ -93,13 +98,13 @@ API Token 至少需要当前账号的：
 
 ### 3. 手动触发第一次部署
 
-打开 Fork 的 **Actions → Sync Upstream Sub-Store → Run workflow**，将 `force` 设为 `true` 后运行。
+打开仓库的 **Actions → Sync Upstream Sub-Store → Run workflow**，将 `force` 设为 `true` 后运行。
 
 工作流每天 UTC 16:00（北京时间 00:00）自动检查上游更新。只有上游有新提交，或手动指定 `force = true` 时才会构建和部署。
 
 ### 4. 手动绑定域名
 
-在 Cloudflare Dashboard 中将自己的 Custom Domain 绑定到 `sub-store-backend`。本 Fork 不创建、不修改、不验证 Custom Domain。
+在 Cloudflare Dashboard 中将自己的 Custom Domain 绑定到 `sub-store-backend`。本项目不创建、不修改、不验证 Custom Domain。
 
 ### 5. 连接前端
 
@@ -179,12 +184,13 @@ PowerShell 使用 `Copy-Item wrangler.toml.example wrangler.toml`，macOS/Linux 
 ## 维护和更新
 
 - 上游业务逻辑：由 [sub-store-org/Sub-Store](https://github.com/sub-store-org/Sub-Store) 维护
-- Workers 适配、KV 存储、QuickJS 沙箱和 CI：由本 Fork 维护
+- Workers 适配、Durable Object/KV 存储、QuickJS 沙箱和 CI：由本项目维护
+- Cloudflare 资源约束：必须兼容 Workers Free；涉及付费资源的改动不得自动合入或部署
 - 上游更新：由 `.github/workflows/sync-upstream.yml` 自动同步
-- Fork 自身修改：提交 `src/`、`esbuild.js` 或 workflow 后，按正常 GitHub Actions 流程验证
+- 本项目修改：提交 `src/`、`esbuild.js` 或 workflow 后，按正常 GitHub Actions 流程验证
 
 详细的模块职责和请求流程见 [`mydocs/codemap/project-overview.md`](mydocs/codemap/project-overview.md)。
 
 ## 许可证
 
-本项目沿用上游 GPL V3 许可证。
+本项目包含上游 Sub-Store 的衍生代码，按上游仓库中的 GNU AGPLv3 许可证发布。Workers 适配层与构建脚本也按同一许可证发布；来源、修改边界和构建方式见 [`NOTICE`](NOTICE)。

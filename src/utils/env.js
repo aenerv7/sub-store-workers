@@ -1,5 +1,6 @@
 import { version as substoreVersion } from '../../../Sub-Store/backend/package.json';
 import { ENV } from '@/vendor/open-api';
+import { getPublicWorkerEnv } from '@/utils/public-env';
 
 const {
     isNode,
@@ -40,19 +41,13 @@ const envObj = {
     isWorker,
 };
 
-// 注入 SUB_STORE_* 环境变量到 meta.worker.env，供前端读取自定义名称和图标
+// 只向前端暴露显示用途的变量，路径密码和推送 URL 必须留在 Worker 内部。
 Object.defineProperty(meta, 'worker', {
     get() {
         const workerEnv = globalThis.__workerEnv || {};
-        const subStoreVars = {};
-        for (const key in workerEnv) {
-            if (typeof workerEnv[key] === 'string' && /^SUB_STORE_/.test(key)) {
-                subStoreVars[key] = workerEnv[key];
-            }
-        }
         return {
             runtime: 'Cloudflare Workers',
-            env: subStoreVars,
+            env: getPublicWorkerEnv(workerEnv),
         };
     },
     enumerable: true,

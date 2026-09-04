@@ -17,6 +17,7 @@ import Gist from '@/utils/gist';
 import migrate from '@/utils/migration';
 import env from '@/utils/env';
 import { formatDateTime } from '@/utils';
+import { getPublicWorkerEnv } from '@/utils/public-env';
 
 export default function register($app) {
     // utils
@@ -117,14 +118,9 @@ function getEnv(req, res) {
     // 读取头像，无则使用默认
     const settings = $.read(SETTINGS_KEY) || {};
     const avatarUrl = settings.avatarUrl || DEFAULT_AVATAR;
-    // 暴露 SUB_STORE_* 环境变量，前端依赖 meta.node.env 校验运行环境
+    // 前端只需要显示名称和图标，不能返回路径密码或推送服务凭据。
     const workerEnv = globalThis.__workerEnv || {};
-    const exposedEnv = {};
-    for (const key of Object.keys(workerEnv)) {
-        if (/^SUB_STORE_/.test(key) && typeof workerEnv[key] === 'string') {
-            exposedEnv[key] = workerEnv[key];
-        }
-    }
+    const exposedEnv = getPublicWorkerEnv(workerEnv);
     const meta = {
         ...(env.meta || {}),
         worker: {
@@ -172,6 +168,11 @@ function getWorkerStatus(req, res) {
                         bound: Boolean(kv?.get && kv?.put),
                         binding: 'SUB_STORE_DATA',
                         dataKeys,
+                    },
+                    storage: {
+                        authoritative: 'Durable Object',
+                        binding: 'SUB_STORE_COORDINATOR',
+                        kvMirror: 'SUB_STORE_DATA',
                     },
                     auth: {
                         backendPathConfigured: Boolean(backendPath),

@@ -1,9 +1,11 @@
 /** Sub-Store Workers 入口 */
 
+import { DurableObject } from 'cloudflare:workers';
 import { version as workersVersion } from '../package.json';
 import { version as substoreVersion } from '../../Sub-Store/backend/package.json';
 const version = `${substoreVersion}(w${workersVersion})`;
 import $ from '@/core/app';
+import { StateDataError } from '@/vendor/open-api';
 import express from '@/vendor/express';
 import migrate from '@/utils/migration';
 
@@ -31,6 +33,18 @@ import { gistBackupAction } from '@/restful/miscs';
 import { consumeShareToken } from '@/restful/token';
 import { SETTINGS_KEY, ARTIFACTS_KEY, SUBS_KEY, COLLECTIONS_KEY } from '@/constants';
 import { findByName } from '@/utils/database';
+import {
+    createStateStore,
+    migrateLegacyKv,
+    StorageUnavailableError,
+} from '@/worker/storage';
+import {
+    applyCors,
+    isOriginAllowed,
+    jsonResponse,
+    preflightResponse,
+    routeRequest,
+} from '@/worker/security';
 
 // 初始化应用及路由
 const $app = express({ substore: $ });
@@ -53,203 +67,240 @@ registerParserRoutes($app);
 registerLogRoutes($app);
 registerAgeRoutes($app);
 
-export default {
-    // 定时同步
-    async scheduled(event, env, ctx) {
-        const kvError = validateKVBinding(env);
-        if (kvError) {
-            console.error(`[Cron] ${kvError.message}`);
-            return;
-        }
-        ctx.waitUntil(cronSyncArtifacts(env));
-    },
+const COORDINATOR_NAME = 'primary';
 
-    async fetch(request, env, ctx) {
-        try {
-            const kvError = validateKVBinding(env);
-            if (kvError) return kvError.response;
+export class SubStoreCoordinator extends DurableObject {
+    constructor(ctx, env) {
+        super(ctx, env);
+        this.queue = Promise.resolve();
+        this.stateStore = null;
+    }
 
-            // CORS 预检
-            if (request.method === 'OPTIONS') {
-                return new Response(null, {
-                    headers: {
-                        'Access-Control-Allow-Origin': '*',
-                        'Access-Control-Allow-Methods': '*',
-                        'Access-Control-Allow-Headers': '*',
-                        'Access-Control-Max-Age': '86400',
-                    },
-                });
+    fetch(request) {
+        return this.enqueue(async () => {
+            const stateStore = await this.getStateStore();
+            return handleRequest(request, this.env, this.ctx, stateStore);
+        });
+    }
+
+    runScheduled() {
+        return this.enqueue(async () => {
+            const stateStore = await this.getStateStore();
+            await initializeApplication(this.env, stateStore);
+            try {
+                await cronSyncArtifacts(this.env);
+                await commitApplicationState(this.ctx);
+            } catch (error) {
+                $.discardPendingPushes();
+                throw error;
             }
+        });
+    }
 
-            const url = new URL(request.url);
-            let pathname = url.pathname;
+    enqueue(operation) {
+        const result = this.queue.then(operation, operation);
+        this.queue = result.then(
+            () => undefined,
+            () => undefined,
+        );
+        return result;
+    }
 
-            // 路径前缀鉴权（可选）
-            // 配置 SUB_STORE_FRONTEND_BACKEND_PATH = "/你的密码" 后
-            // 前端后端地址填: https://你的自定义域名/你的密码
-            // 管理 API 需要带前缀才能访问，分享链接（download/preview）不受影响
-            const backendPath = env.SUB_STORE_FRONTEND_BACKEND_PATH;
-            const isPublicPath = /^\/(api\/download|api\/preview|api\/sub\/flow)/.test(pathname);
-            const isManagementApi = !isPublicPath && pathname.startsWith('/api/');
-            const isAuthDisabledManagementApi = !backendPath && isManagementApi;
-            if (isAuthDisabledManagementApi) {
-                console.warn(`[Security] SUB_STORE_FRONTEND_BACKEND_PATH is not configured; management API is publicly accessible: ${pathname}`);
-            }
-            if (backendPath) {
-                if (!isPublicPath && pathname.startsWith('/api/')) {
-                    // 直接访问 /api/* 没带前缀，拒绝
-                    return new Response(JSON.stringify({ status: 'failed', message: 'Unauthorized' }), {
-                        status: 401,
-                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-                    });
-                }
-                if (pathname === backendPath) {
-                    // 精确匹配前缀，重定向到带 / 的路径
-                    return new Response(null, {
-                        status: 302,
-                        headers: {
-                            'Location': new URL(backendPath + '/', request.url).toString(),
-                            'Access-Control-Allow-Origin': '*',
-                        },
-                    });
-                }
-                if (pathname.startsWith(backendPath + '/')) {
-                    // 带了前缀，剥离后交给路由
-                    pathname = pathname.slice(backendPath.length);
-                    const newUrl = new URL(request.url);
-                    newUrl.pathname = pathname;
-                    // 通过密码前缀访问才注入 share 标记（与上游 be_merge 行为一致）
-                    if (pathname.startsWith('/api/')) {
-                        newUrl.searchParams.set('share', 'true');
-                    }
-                    request = new Request(newUrl.toString(), request);
-                }
-            }
-
-            // 注入环境变量
-            globalThis.__workerEnv = env;
-
-            // 从 KV 加载数据
-            await $.initFromKV(env.SUB_STORE_DATA);
-            $.workerEnv = env;
-
-            // 数据迁移
-            migrate();
-
-            console.log(`Sub-Store Workers v${version} handling: ${request.method} ${pathname}`);
-
-            // /share/ 路由的 token 验证（与上游 Node.js 版 be_merge 行为一致）
-            // 所有 /share/ 请求都必须携带有效 token，未分享的订阅/文件不可直接访问
-            if (pathname.startsWith('/share/')) {
-                if (request.method.toUpperCase() !== 'GET') {
-                    return new Response(JSON.stringify({ status: 'failed', message: 'Method not allowed' }), {
-                        status: 405,
-                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-                    });
-                }
-                const tokenValue = url.searchParams.get('token');
-                if (!tokenValue) {
-                    // 未提供 token，拒绝访问
-                    return new Response(JSON.stringify({ status: 'failed', message: 'Share token is required' }), {
-                        status: 403,
-                        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-                    });
-                }
-                const decodedPathname = decodeURIComponent(pathname);
-                const shareToken = consumeShareToken({
-                    token: tokenValue,
-                    pathname: decodedPathname,
-                });
-                if (!shareToken) {
-                    // token 无效
-                    const settings = $.read(SETTINGS_KEY);
-                    if (settings?.appearanceSetting?.invalidShareFakeNode) {
-                        // 返回假节点
-                        const fakeUrl = new URL(request.url);
-                        fakeUrl.pathname = pathname.replace(/\/share\/.*?\//, '/share/sub/');
-                        fakeUrl.searchParams.set('_fakeNode', 'true');
-                        request = new Request(fakeUrl.toString(), request);
-                    } else {
-                        return new Response(JSON.stringify({ status: 'failed', message: 'Invalid or expired share token' }), {
-                            status: 404,
-                            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-                        });
-                    }
-                }
-                // token 有效，继续正常路由
-            }
-
-            // 路由分发
-            const response = await $app.handleRequest(request);
-
-            // 禁止 Cloudflare CDN/边缘节点缓存动态 API 响应
-            // 未设置此头时，不同 URL 路径（如 /share/ 和 /download/）的响应可能被独立缓存，
-            // 导致同一订阅在不同接口返回不一致（陈旧）的数据
-            response.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-            response.headers.set('CDN-Cache-Control', 'no-store');
-
-            if (isAuthDisabledManagementApi) {
-                response.headers.set('X-Sub-Store-Security-Warning', 'SUB_STORE_FRONTEND_BACKEND_PATH is not configured; management API is public');
-            }
-
-            // 回写 KV + 确保推送完成
-            ctx.waitUntil(Promise.all([
-                $.persistCache(),
-                ...($.pendingPushes || []),
-            ]));
-            $.pendingPushes = [];
-
-            return response;
-        } catch (e) {
-            console.error(`Unhandled error: ${e.message}\n${e.stack}`);
-            // 出错也尝试回写
-            ctx.waitUntil(Promise.all([
-                $.persistCache(),
-                ...($.pendingPushes || []),
-            ]));
-            $.pendingPushes = [];
-            return new Response(
-                JSON.stringify({
-                    status: 'failed',
-                    message: 'Internal Server Error',
-                }),
-                {
-                    status: 500,
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Access-Control-Allow-Origin': '*',
-                    },
-                },
+    async getStateStore() {
+        if (!this.stateStore) {
+            await migrateLegacyKv(this.ctx.storage, this.env.SUB_STORE_DATA);
+            this.stateStore = createStateStore(
+                this.ctx.storage,
+                this.env.SUB_STORE_DATA,
+                this.ctx,
             );
         }
+        return this.stateStore;
+    }
+}
+
+export default {
+    async scheduled(_event, env, ctx) {
+        const bindingError = validateBindings(env);
+        if (bindingError) {
+            console.error(bindingError.message);
+            return;
+        }
+        ctx.waitUntil(getCoordinator(env).runScheduled());
+    },
+
+    async fetch(request, env) {
+        const bindingError = validateBindings(env);
+        if (bindingError) return bindingError.response;
+        return getCoordinator(env).fetch(request);
     },
 };
 
-function validateKVBinding(env) {
-    if (env?.SUB_STORE_DATA?.get && env?.SUB_STORE_DATA?.put) return null;
-    const body = JSON.stringify({
-        status: 'failed',
-        message: 'Missing KV binding: SUB_STORE_DATA. Please bind a Cloudflare KV namespace named SUB_STORE_DATA before running Sub-Store Workers.',
+async function handleRequest(originalRequest, env, ctx, stateStore) {
+    let request = originalRequest;
+    let initialized = false;
+    try {
+        const routed = routeRequest(request, env.SUB_STORE_FRONTEND_BACKEND_PATH);
+        if (routed.response) return applyCors(routed.response, request, env);
+        request = routed.request;
+        const pathname = routed.pathname;
+
+        if (!isOriginAllowed(request, env)) {
+            return jsonResponse(403, {
+                status: 'failed',
+                message: 'CORS origin not allowed',
+            });
+        }
+        if (request.method === 'OPTIONS') {
+            return preflightResponse(request, env);
+        }
+
+        await initializeApplication(env, stateStore);
+        initialized = true;
+
+        if (pathname === '/_health') {
+            return commitResponse(
+                jsonResponse(200, {
+                    status: 'ok',
+                    version,
+                    storage: 'durable-object',
+                }),
+                request,
+                env,
+                ctx,
+            );
+        }
+
+        console.log(
+            JSON.stringify({
+                event: 'request',
+                version,
+                method: request.method,
+                pathname,
+            }),
+        );
+
+        if (pathname.startsWith('/share/')) {
+            const shareError = validateShareRequest(request, pathname);
+            if (shareError) {
+                return commitResponse(shareError, request, env, ctx);
+            }
+            request = applyInvalidShareFallback(request, pathname);
+            if (!request) {
+                return commitResponse(
+                    jsonResponse(404, {
+                        status: 'failed',
+                        message: 'Invalid or expired share token',
+                    }),
+                    originalRequest,
+                    env,
+                    ctx,
+                );
+            }
+        }
+
+        const response = await $app.handleRequest(request);
+        return commitResponse(response, request, env, ctx);
+    } catch (error) {
+        $.discardPendingPushes();
+        const unavailable =
+            error instanceof StorageUnavailableError ||
+            error instanceof StateDataError;
+        console.error(
+            JSON.stringify({
+                event: unavailable ? 'storage_unavailable' : 'request_failed',
+                error: error?.message ?? String(error),
+                stack: error?.stack,
+            }),
+        );
+        const response = jsonResponse(unavailable ? 503 : 500, {
+            status: 'failed',
+            message: unavailable
+                ? 'Storage temporarily unavailable'
+                : 'Internal Server Error',
+        });
+        return applyCors(response, originalRequest, env);
+    } finally {
+        if (!initialized) $.discardPendingPushes();
+    }
+}
+
+async function initializeApplication(env, stateStore) {
+    globalThis.__workerEnv = env;
+    await $.initFromStorage(stateStore);
+    $.workerEnv = env;
+    migrate();
+}
+
+async function commitResponse(response, request, env, ctx) {
+    await commitApplicationState(ctx);
+    response.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    response.headers.set('CDN-Cache-Control', 'no-store');
+    return applyCors(response, request, env);
+}
+
+async function commitApplicationState(ctx) {
+    await $.persistCache();
+    const pushes = $.drainPendingPushes();
+    if (pushes.length > 0) ctx.waitUntil(Promise.allSettled(pushes));
+}
+
+function validateShareRequest(request, pathname) {
+    if (request.method.toUpperCase() !== 'GET') {
+        return jsonResponse(405, {
+            status: 'failed',
+            message: 'Method not allowed',
+        });
+    }
+    const token = new URL(request.url).searchParams.get('token');
+    if (!token) {
+        return jsonResponse(403, {
+            status: 'failed',
+            message: 'Share token is required',
+        });
+    }
+    return null;
+}
+
+function applyInvalidShareFallback(request, pathname) {
+    const token = new URL(request.url).searchParams.get('token');
+    const shareToken = consumeShareToken({
+        token,
+        pathname: decodeURIComponent(pathname),
     });
+    if (shareToken) return request;
+
+    const settings = $.read(SETTINGS_KEY);
+    if (!settings?.appearanceSetting?.invalidShareFakeNode) return null;
+    const fakeUrl = new URL(request.url);
+    fakeUrl.pathname = pathname.replace(/\/share\/.*?\//, '/share/sub/');
+    fakeUrl.searchParams.set('_fakeNode', 'true');
+    return new Request(fakeUrl.toString(), request);
+}
+
+function getCoordinator(env) {
+    return env.SUB_STORE_COORDINATOR.getByName(COORDINATOR_NAME);
+}
+
+function validateBindings(env) {
+    const missing = [];
+    if (!env?.SUB_STORE_DATA?.get || !env?.SUB_STORE_DATA?.put) {
+        missing.push('SUB_STORE_DATA');
+    }
+    if (!env?.SUB_STORE_COORDINATOR?.getByName) {
+        missing.push('SUB_STORE_COORDINATOR');
+    }
+    if (missing.length === 0) return null;
+    const message = `Missing Worker bindings: ${missing.join(', ')}`;
     return {
-        message: 'Missing KV binding: SUB_STORE_DATA',
-        response: new Response(body, {
-            status: 500,
-            headers: {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-            },
-        }),
+        message,
+        response: jsonResponse(500, { status: 'failed', message }),
     };
 }
 
 /** 定时同步 artifacts 到 Gist */
 async function cronSyncArtifacts(env) {
     try {
-        globalThis.__workerEnv = env;
-        await $.initFromKV(env.SUB_STORE_DATA);
-        $.workerEnv = env;
-
         console.log(`[Cron] Sub-Store Workers v${version} 开始同步...`);
 
         const settings = $.read(SETTINGS_KEY);
@@ -382,11 +433,9 @@ async function cronSyncArtifacts(env) {
             console.error(`[Cron] Gist 备份失败: ${e.message ?? e}`);
         }
 
-        await $.persistCache();
         console.log('[Cron] 同步完成');
     } catch (e) {
         console.error(`[Cron] 同步失败: ${e.message ?? e}`);
-        // 尝试回写
-        try { await $.persistCache(); } catch (_) {}
+        throw e;
     }
 }

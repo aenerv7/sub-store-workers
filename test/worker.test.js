@@ -1,0 +1,145 @@
+import { env, SELF } from 'cloudflare:test';
+import { describe, expect, it } from 'vitest';
+import {
+    migrateLegacyKv,
+    StorageUnavailableError,
+} from '../src/worker/storage.js';
+import { routeRequest } from '../src/worker/security.js';
+
+describe('Worker security boundary', () => {
+    it.each([
+        '/api/utils/worker-status',
+        '/api/preview/sub',
+        '/api/sub/flow/missing',
+        '/download/missing',
+    ])('rejects an unprefixed protected route: %s', async (pathname) => {
+        const response = await SELF.fetch(`https://example.com${pathname}`);
+        expect(response.status).toBe(401);
+    });
+
+    it('fails closed when the backend path is missing', () => {
+        const result = routeRequest(
+            new Request('https://example.com/api/utils/env'),
+            undefined,
+        );
+        expect(result.response.status).toBe(503);
+    });
+
+    it('allows only configured browser origins', async () => {
+        const allowed = await SELF.fetch('https://example.com/_health', {
+            headers: { Origin: 'https://sub-store.vercel.app' },
+        });
+        expect(allowed.status).toBe(200);
+        expect(allowed.headers.get('Access-Control-Allow-Origin')).toBe(
+            'https://sub-store.vercel.app',
+        );
+
+        const rejected = await SELF.fetch('https://example.com/_health', {
+            headers: { Origin: 'https://attacker.example' },
+        });
+        expect(rejected.status).toBe(403);
+        expect(rejected.headers.has('Access-Control-Allow-Origin')).toBe(false);
+    });
+
+    it('does not expose secrets through the environment endpoint', async () => {
+        const response = await SELF.fetch(
+            'https://example.com/test-secret/api/utils/env',
+        );
+        expect(response.status).toBe(200);
+        const body = await response.json();
+        const exposed = body.data.meta.worker.env;
+        expect(exposed.SUB_STORE_BACKEND_CUSTOM_NAME).toBe('Workers Test');
+        expect(exposed.SUB_STORE_FRONTEND_BACKEND_PATH).toBeUndefined();
+        expect(exposed.SUB_STORE_PUSH_SERVICE).toBeUndefined();
+        expect(JSON.stringify(body)).not.toContain('private-token');
+        expect(JSON.stringify(body)).not.toContain('/test-secret');
+    });
+
+    it('returns 404 for a route suffix instead of matching the root route', async () => {
+        const response = await SELF.fetch('https://example.com/not-a-route');
+        expect(response.status).toBe(404);
+    });
+});
+
+describe('Durable Object state migration', () => {
+    it('imports existing KV state on first access', async () => {
+        await env.SUB_STORE_DATA.put(
+            'sub-store',
+            JSON.stringify({ settings: { migrationMarker: 'legacy-kv' } }),
+        );
+        await env.SUB_STORE_DATA.put('root', '{}');
+
+        const coordinator = env.SUB_STORE_COORDINATOR.getByName(
+            `migration-test-${crypto.randomUUID()}`,
+        );
+        const response = await coordinator.fetch(
+            new Request('https://example.com/test-secret/api/storage'),
+        );
+        expect(response.status).toBe(200);
+        const body = await response.json();
+        expect(body.settings.migrationMarker).toBe('legacy-kv');
+    });
+
+    it('does not write empty state when a KV read fails', async () => {
+        const writes = [];
+        const storage = {
+            get: async () => undefined,
+            put: async (value) => writes.push(value),
+        };
+        const brokenKv = {
+            get: async () => {
+                throw new Error('temporary KV outage');
+            },
+            put: async () => {},
+        };
+
+        await expect(migrateLegacyKv(storage, brokenKv)).rejects.toBeInstanceOf(
+            StorageUnavailableError,
+        );
+        expect(writes).toEqual([]);
+    });
+
+    it('serializes count-limited share token consumption', async () => {
+        const state = {
+            settings: {},
+            subs: [
+                {
+                    name: 'demo',
+                    source: 'local',
+                    content:
+                        'demo = ss, 1.1.1.1, 443, encrypt-method=aes-128-gcm, password=test',
+                },
+            ],
+            collections: [],
+            files: [],
+            artifacts: [],
+            tokens: [
+                {
+                    type: 'sub',
+                    name: 'demo',
+                    token: 'single-use',
+                    mode: 'count',
+                    count: 1,
+                    usedCount: 0,
+                    createdAt: Date.now(),
+                },
+            ],
+        };
+        await env.SUB_STORE_DATA.put('sub-store', JSON.stringify(state));
+        await env.SUB_STORE_DATA.put('root', '{}');
+
+        const coordinator = env.SUB_STORE_COORDINATOR.getByName(
+            `count-test-${crypto.randomUUID()}`,
+        );
+        const url =
+            'https://example.com/share/sub/demo/JSON?token=single-use';
+        const responses = await Promise.all([
+            coordinator.fetch(new Request(url)),
+            coordinator.fetch(new Request(url)),
+        ]);
+        expect(responses.map((response) => response.status).sort()).toEqual([
+            200,
+            404,
+        ]);
+    });
+});

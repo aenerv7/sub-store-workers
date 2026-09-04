@@ -37,7 +37,7 @@ export class OpenAPI {
         this.cache = {};
         this.root = {};
 
-        this._kvBinding = null; // set by initFromKV()
+        this._storageBinding = null;
         this._dirty = false;
         this._rootDirty = false;
         this._cacheSnapshot = '';
@@ -54,80 +54,57 @@ export class OpenAPI {
         };
     }
 
-    /** 从 KV 初始化 */
-    async initFromKV(kvBinding) {
-        this._kvBinding = kvBinding;
+    /** 从 Durable Object 的强一致存储初始化 */
+    async initFromStorage(storageBinding) {
+        this._storageBinding = storageBinding;
         this._dirty = false;
         this._rootDirty = false;
+        this.pendingPushes = [];
 
-        // 加载主缓存
-        try {
-            const raw = await kvBinding.get(this.name, 'text', { cacheTtl: 60 });
-            if (raw) {
-                this.cache = JSON.parse(raw);
-                if (!isPlainObject(this.cache)) {
-                    this.cache = {};
-                }
-                this._cacheSnapshot = raw;
-            } else {
-                this.cache = {};
-                this._cacheSnapshot = '{}';
-            }
-        } catch (e) {
-            this.error(`Failed to load cache from KV: ${e.message}`);
-            this.cache = {};
-            this._cacheSnapshot = '{}';
-        }
-
-        // 加载根数据
-        try {
-            const raw = await kvBinding.get('root', 'text', { cacheTtl: 60 });
-            if (raw) {
-                this.root = JSON.parse(raw);
-                if (!isPlainObject(this.root)) {
-                    this.root = {};
-                }
-                this._rootSnapshot = raw;
-            } else {
-                this.root = {};
-                this._rootSnapshot = '{}';
-            }
-        } catch (e) {
-            this.error(`Failed to load root from KV: ${e.message}`);
-            this.root = {};
-        }
+        const [cacheRaw, rootRaw] = await Promise.all([
+            storageBinding.get(this.name),
+            storageBinding.get('root'),
+        ]);
+        this.cache = parseStoredObject(cacheRaw, this.name);
+        this.root = parseStoredObject(rootRaw, 'root');
+        this._cacheSnapshot = cacheRaw;
+        this._rootSnapshot = rootRaw;
 
         installConsoleLogCapture(this);
     }
 
     // 同步初始化（空操作）
     initCache() {
-        // 由 initFromKV 处理
+        // 由 initFromStorage 处理
     }
 
-    // 回写缓存到 KV
+    // 回写缓存到权威存储
     async persistCache() {
-        if (!this._kvBinding) return;
-        const promises = [];
+        if (!this._storageBinding) return;
+        const entries = {};
+        let cacheSnapshot;
+        let rootSnapshot;
         if (this._dirty) {
             const current = JSON.stringify(this.cache, null, 2);
             if (current !== this._cacheSnapshot) {
-                promises.push(this._kvBinding.put(this.name, current));
-                this._cacheSnapshot = current;
+                entries[this.name] = current;
+                cacheSnapshot = current;
             }
-            this._dirty = false;
         }
         if (this._rootDirty) {
             const current = JSON.stringify(this.root, null, 2);
             if (current !== this._rootSnapshot) {
-                promises.push(this._kvBinding.put('root', current));
-                this._rootSnapshot = current;
+                entries.root = current;
+                rootSnapshot = current;
             }
-            this._rootDirty = false;
         }
-        if (promises.length > 0) {
-            await Promise.all(promises);
+        if (Object.keys(entries).length > 0) {
+            await this._storageBinding.putMany(entries);
         }
+        if (cacheSnapshot !== undefined) this._cacheSnapshot = cacheSnapshot;
+        if (rootSnapshot !== undefined) this._rootSnapshot = rootSnapshot;
+        this._dirty = false;
+        this._rootDirty = false;
     }
 
     write(data, key) {
@@ -180,17 +157,27 @@ export class OpenAPI {
             const url = push
                 .replace('[推送标题]', encodeURIComponent(title || 'Sub-Store'))
                 .replace('[推送内容]', encodeURIComponent([subtitle, content_].filter(Boolean).join('\n')));
-            const pushPromise = fetch(url)
-                .then((resp) => {
-                    console.log(`[Push Service] URL: ${url}\nRES: ${resp.status}`);
-                })
-                .catch((e) => {
-                    console.log(`[Push Service] URL: ${url}\nERROR: ${e}`);
-                });
-            // 收集到 pendingPushes，由 ctx.waitUntil 保证完成
+            const target = getSafePushTarget(url);
             if (!this.pendingPushes) this.pendingPushes = [];
-            this.pendingPushes.push(pushPromise);
+            this.pendingPushes.push(async () => {
+                try {
+                    const resp = await fetch(url);
+                    console.log(`[Push Service] Target: ${target}\nRES: ${resp.status}`);
+                } catch (e) {
+                    console.error(`[Push Service] Target: ${target}\nERROR: ${e}`);
+                }
+            });
         }
+    }
+
+    drainPendingPushes() {
+        const jobs = this.pendingPushes || [];
+        this.pendingPushes = [];
+        return jobs.map((job) => job());
+    }
+
+    discardPendingPushes() {
+        this.pendingPushes = [];
     }
 
     log(msg) {
@@ -215,6 +202,39 @@ export class OpenAPI {
 
     done(value = {}) {
         // 空操作
+    }
+}
+
+export class StateDataError extends Error {
+    constructor(message, cause) {
+        super(message, { cause });
+        this.name = 'StateDataError';
+    }
+}
+
+function parseStoredObject(raw, key) {
+    if (typeof raw !== 'string') {
+        throw new StateDataError(`Missing state document: ${key}`);
+    }
+    let value;
+    try {
+        value = JSON.parse(raw);
+    } catch (error) {
+        throw new StateDataError(`State document ${key} is invalid JSON`, error);
+    }
+    if (!isPlainObject(value)) {
+        throw new StateDataError(
+            `State document ${key} must contain a JSON object`,
+        );
+    }
+    return value;
+}
+
+function getSafePushTarget(value) {
+    try {
+        return new URL(value).origin;
+    } catch {
+        return '[invalid URL]';
     }
 }
 

@@ -23,4 +23,15 @@ crons = ["0 21 * * *"]
 # SUB_STORE_PUSH_SERVICE = "https://api.day.app/你的BarkKey/[推送标题]/[推送内容]"
 SCRIPT_ENGINE = "quickjs"
 SUB_STORE_BACKEND_CUSTOM_NAME = "Workers"
-SUB_STORE_BACKEND_CUSTOM_ICON = "https://cdn.jsdelivr.net/gh/Yu9191/sub-store-workers@main/png/cloudflare.png"
+SUB_STORE_BACKEND_CUSTOM_ICON = "https://cdn.jsdelivr.net/gh/aenerv7/sub-store-workers@main/png/cloudflare.png"
+
+[observability]
+enabled = true
+
+[[durable_objects.bindings]]
+name = "SUB_STORE_COORDINATOR"
+class_name = "SubStoreCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SubStoreCoordinator"]

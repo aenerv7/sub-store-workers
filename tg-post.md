@@ -7,7 +7,7 @@ Sub-Store Workers
 • Cron 定时同步 Gist
 • 部署只需 6 步，README 有图文教程
 
-https://github.com/Yu9191/sub-store-workers
+https://github.com/aenerv7/sub-store-workers
 
 致敬 Sub-Store 开源项目及所有贡献者 🙏
 
