@@ -1,4 +1,4 @@
-name: Sync Upstream Sub-Store
+name: Sync and Deploy Sub-Store
 
 on:
   schedule:
@@ -19,6 +19,7 @@ concurrency:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   WORKER_NAME: sub-store-backend
+  FRONTEND_WORKER_NAME: sub-store
 
 jobs:
   sync:
@@ -324,7 +325,7 @@ jobs:
             echo "| 上次同步 SHA | \`${{ steps.last.outputs.sha }}\` |"
             echo "| Worker 原始大小 | ${{ steps.size.outputs.kb }} KB (${{ steps.size.outputs.mb }} MB) |"
             echo "| Worker gzip 大小 | ${{ steps.size.outputs.gzip_kb }} KB |"
-            echo "| Pages | 未部署 |"
+            echo "| 前端 | 由后续 Static Assets job 独立检查和部署 |"
             echo "| Custom Domain | 未配置（请在 Cloudflare Dashboard 手动绑定） |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -337,4 +338,214 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .upstream-sha
           git commit -m "chore: sync upstream to ${{ steps.upstream.outputs.version }} [skip ci]" || exit 0
+          git push origin HEAD:main
+
+  frontend:
+    needs: sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout sub-store-workers
+        uses: actions/checkout@v4
+        with:
+          path: sub-store-workers
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve latest front-end release
+        id: release
+        working-directory: sub-store-workers
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RELEASE=$(gh api repos/sub-store-org/Sub-Store-Front-End/releases/latest)
+          TAG=$(jq -r '.tag_name' <<<"$RELEASE")
+          ASSET_URL=$(jq -r '.assets[]? | select(.name == "dist.zip") | .browser_download_url' <<<"$RELEASE" | head -n 1)
+          DIGEST=$(jq -r '.assets[]? | select(.name == "dist.zip") | .digest // empty' <<<"$RELEASE" | head -n 1)
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ] || [ -z "$ASSET_URL" ]; then
+            echo "::error::The latest Sub-Store-Front-End release has no dist.zip asset"
+            exit 1
+          fi
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::The dist.zip release asset has no valid SHA-256 digest"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset_url=$ASSET_URL" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=${TAG}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Latest front-end release: $TAG"
+
+      - name: Check if front-end update is needed
+        id: check
+        working-directory: sub-store-workers
+        env:
+          FORCE: ${{ inputs.force }}
+          LATEST_TAG: ${{ steps.release.outputs.tag }}
+          LATEST_FINGERPRINT: ${{ steps.release.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          CURRENT=$(tr -d '\r\n' < .frontend-upstream-version 2>/dev/null || true)
+          if [ "$CURRENT" = "$LATEST_FINGERPRINT" ] && [ "$FORCE" != "true" ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Front-end is already at $LATEST_TAG"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "Front-end update needed: ${CURRENT:-none} -> $LATEST_TAG"
+          fi
+
+      - name: Setup Node
+        if: steps.check.outputs.needed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: sub-store-workers/package-lock.json
+
+      - name: Install Wrangler
+        if: steps.check.outputs.needed == 'true'
+        working-directory: sub-store-workers
+        run: npm ci
+
+      - name: Download and verify front-end release
+        if: steps.check.outputs.needed == 'true'
+        working-directory: sub-store-workers
+        env:
+          ASSET_URL: ${{ steps.release.outputs.asset_url }}
+          EXPECTED_DIGEST: ${{ steps.release.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p .frontend-release
+          curl --fail-with-body -L --retry 3 --max-time 120 "$ASSET_URL" -o /tmp/sub-store-frontend.zip
+          EXPECTED=${EXPECTED_DIGEST#sha256:}
+          ACTUAL=$(sha256sum /tmp/sub-store-frontend.zip | awk '{print $1}')
+          if [ "${ACTUAL,,}" != "${EXPECTED,,}" ]; then
+            echo "::error::Front-end release digest mismatch"
+            exit 1
+          fi
+          ARCHIVE_PATHS=$(unzip -Z1 /tmp/sub-store-frontend.zip)
+          if grep -Eq '(^/|(^|/)\.\.(/|$)|\\)' <<<"$ARCHIVE_PATHS"; then
+            echo "::error::Front-end release contains an unsafe archive path"
+            exit 1
+          fi
+          unzip -q /tmp/sub-store-frontend.zip -d .frontend-release
+          test -f .frontend-release/dist/index.html
+          grep -qi '<title>Sub Store</title>' .frontend-release/dist/index.html
+
+      - name: Check Static Assets Free limits
+        if: steps.check.outputs.needed == 'true'
+        id: assets
+        working-directory: sub-store-workers
+        run: |
+          set -euo pipefail
+          FILE_COUNT=$(find .frontend-release/dist -type f | wc -l)
+          TOTAL_BYTES=$(du -sb .frontend-release/dist | awk '{print $1}')
+          MAX_BYTES=$(find .frontend-release/dist -type f -printf '%s\n' | sort -nr | head -n 1)
+          test "$FILE_COUNT" -gt 0
+          if [ "$FILE_COUNT" -gt 20000 ]; then
+            echo "::error::Static Assets file count $FILE_COUNT exceeds the Workers Free limit of 20,000"
+            exit 1
+          fi
+          if [ "$MAX_BYTES" -gt $((25 * 1024 * 1024)) ]; then
+            echo "::error::A Static Assets file exceeds the 25 MiB per-file limit"
+            exit 1
+          fi
+          echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "total_bytes=$TOTAL_BYTES" >> "$GITHUB_OUTPUT"
+          echo "Static Assets: $FILE_COUNT files, $TOTAL_BYTES bytes"
+
+      - name: Deploy front-end Static Assets Worker
+        if: steps.check.outputs.needed == 'true'
+        working-directory: sub-store-workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          PREVIOUS=""
+          if DEPLOYMENTS=$(npx wrangler deployments list --name "$FRONTEND_WORKER_NAME" --json 2>/dev/null); then
+            PREVIOUS=$(jq -r '((max_by(.created_on) // {}) | ([.versions[]?] | max_by(.percentage).version_id)) // empty' <<<"$DEPLOYMENTS")
+          fi
+          if [ -n "$PREVIOUS" ]; then
+            printf '%s\n' "$PREVIOUS" > /tmp/previous-frontend-version
+          fi
+          npx wrangler deploy --config wrangler.frontend.jsonc
+
+      - name: Verify front-end Static Assets
+        if: steps.check.outputs.needed == 'true'
+        id: verify
+        working-directory: sub-store-workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          API="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/subdomain"
+          RESPONSE=$(curl --fail-with-body -sS "$API" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json")
+          jq -e '.success == true' >/dev/null <<<"$RESPONSE"
+          SUBDOMAIN=$(jq -r '.result.subdomain' <<<"$RESPONSE")
+          test -n "$SUBDOMAIN"
+          FRONTEND_URL="https://${FRONTEND_WORKER_NAME}.${SUBDOMAIN}.workers.dev"
+          echo "url=$FRONTEND_URL" >> "$GITHUB_OUTPUT"
+
+          for ATTEMPT in 1 2 3 4 5 6; do
+            ROOT_STATUS=$(curl -sS --max-time 20 -o /tmp/frontend-root -w '%{http_code}' "$FRONTEND_URL/" || true)
+            SPA_STATUS=$(curl -sS --max-time 20 -H 'Sec-Fetch-Mode: navigate' -o /tmp/frontend-spa -w '%{http_code}' "$FRONTEND_URL/settings" || true)
+            if [ "$ROOT_STATUS" = "200" ] && [ "$SPA_STATUS" = "200" ] && \
+              grep -qi '<title>Sub Store</title>' /tmp/frontend-root && \
+              grep -qi '<title>Sub Store</title>' /tmp/frontend-spa; then
+              echo "Front-end verified at $FRONTEND_URL"
+              exit 0
+            fi
+            echo "Verification attempt ${ATTEMPT}/6 returned root=$ROOT_STATUS spa=$SPA_STATUS"
+            if [ "$ATTEMPT" != "6" ]; then sleep 5; fi
+          done
+          echo "::error::Front-end Static Assets verification failed"
+          exit 1
+
+      - name: Roll back failed front-end deployment
+        if: failure() && steps.check.outputs.needed == 'true'
+        working-directory: sub-store-workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ ! -s /tmp/previous-frontend-version ]; then
+            echo "No previous front-end version was recorded; rollback skipped"
+            exit 0
+          fi
+          PREVIOUS=$(cat /tmp/previous-frontend-version)
+          npx wrangler rollback "$PREVIOUS" --name "$FRONTEND_WORKER_NAME" --message "Automated rollback after failed Static Assets verification" --yes
+
+      - name: Write front-end job summary
+        if: always() && steps.check.outputs.needed == 'true'
+        run: |
+          {
+            echo "## Sub-Store 前端同步结果"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| Static Assets Worker | \`${FRONTEND_WORKER_NAME}\` |"
+            echo "| 上游 Release | \`${{ steps.release.outputs.tag }}\` |"
+            echo "| 文件数 | ${{ steps.assets.outputs.file_count }} |"
+            echo "| 静态资源大小 | ${{ steps.assets.outputs.total_bytes }} bytes |"
+            echo "| workers.dev | ${{ steps.verify.outputs.url }} |"
+            echo "| 计费路径 | 纯 Static Assets，不执行 Worker 脚本 |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update front-end release marker
+        if: success() && steps.check.outputs.needed == 'true'
+        working-directory: sub-store-workers
+        run: |
+          echo "${{ steps.release.outputs.fingerprint }}" > .frontend-upstream-version
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .frontend-upstream-version
+          git commit -m "chore: sync front-end to ${{ steps.release.outputs.tag }} [skip ci]" || exit 0
           git push origin HEAD:main

@@ -2,5 +2,6 @@ node_modules/
 dist/
 pages-dist/_worker.js
 .wrangler/
+.frontend-release/
 .dev.vars
 wrangler.toml
