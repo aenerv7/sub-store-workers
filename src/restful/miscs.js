@@ -18,6 +18,7 @@ import migrate from '@/utils/migration';
 import env from '@/utils/env';
 import { formatDateTime } from '@/utils';
 import { getPublicWorkerEnv } from '@/utils/public-env';
+import { getBackendPath } from '@/worker/security';
 
 export default function register($app) {
     // utils
@@ -121,6 +122,14 @@ function getEnv(req, res) {
     // 前端只需要显示名称和图标，不能返回路径密码或推送服务凭据。
     const workerEnv = globalThis.__workerEnv || {};
     const exposedEnv = getPublicWorkerEnv(workerEnv);
+    // The frontend needs the URL prefix to construct share links. Only expose
+    // the normalized path for the explicit share-mode environment request.
+    if (req.query.share) {
+        const backendPath = getBackendPath(
+            workerEnv.SUB_STORE_FRONTEND_BACKEND_PATH,
+        );
+        if (backendPath) exposedEnv.SUB_STORE_FRONTEND_BACKEND_PATH = backendPath;
+    }
     const meta = {
         ...(env.meta || {}),
         worker: {

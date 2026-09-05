@@ -59,10 +59,19 @@ describe('Worker security boundary', () => {
         const body = await response.json();
         const exposed = body.data.meta.worker.env;
         expect(exposed.SUB_STORE_BACKEND_CUSTOM_NAME).toBe('Workers Test');
-        expect(exposed.SUB_STORE_FRONTEND_BACKEND_PATH).toBeUndefined();
+        expect(exposed.SUB_STORE_FRONTEND_BACKEND_PATH).toBe('/test-secret');
         expect(exposed.SUB_STORE_PUSH_SERVICE).toBeUndefined();
         expect(JSON.stringify(body)).not.toContain('private-token');
-        expect(JSON.stringify(body)).not.toContain('/test-secret');
+    });
+
+    it('returns the normalized backend path for share-mode environment requests', async () => {
+        const response = await SELF.fetch(
+            'https://example.com/test-secret/api/utils/env',
+        );
+        const body = await response.json();
+        expect(body.data.meta.worker.env.SUB_STORE_FRONTEND_BACKEND_PATH).toBe(
+            '/test-secret',
+        );
     });
 
     it('returns 404 for a route suffix instead of matching the root route', async () => {
