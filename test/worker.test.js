@@ -4,7 +4,7 @@ import {
     migrateLegacyKv,
     StorageUnavailableError,
 } from '../src/worker/storage.js';
-import { routeRequest } from '../src/worker/security.js';
+import { getBackendPath, routeRequest } from '../src/worker/security.js';
 
 describe('Worker security boundary', () => {
     it.each([
@@ -23,6 +23,16 @@ describe('Worker security boundary', () => {
             undefined,
         );
         expect(result.response.status).toBe(503);
+    });
+
+    it('normalizes a password-only backend path for share links', () => {
+        expect(getBackendPath('test-secret')).toBe('/test-secret');
+        const result = routeRequest(
+            new Request('https://example.com/test-secret/api/utils/env'),
+            'test-secret',
+        );
+        expect(result.pathname).toBe('/api/utils/env');
+        expect(new URL(result.request.url).searchParams.get('share')).toBe('true');
     });
 
     it('allows only configured browser origins', async () => {

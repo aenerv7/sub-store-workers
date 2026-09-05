@@ -43,6 +43,7 @@ import {
     isOriginAllowed,
     jsonResponse,
     preflightResponse,
+    getBackendPath,
     routeRequest,
 } from '@/worker/security';
 
@@ -226,6 +227,12 @@ async function handleRequest(originalRequest, env, ctx, stateStore) {
 }
 
 async function initializeApplication(env, stateStore) {
+    const normalizedBackendPath = getBackendPath(
+        env.SUB_STORE_FRONTEND_BACKEND_PATH,
+    );
+    if (normalizedBackendPath) {
+        env.SUB_STORE_FRONTEND_BACKEND_PATH = normalizedBackendPath;
+    }
     globalThis.__workerEnv = env;
     await $.initFromStorage(stateStore);
     $.workerEnv = env;

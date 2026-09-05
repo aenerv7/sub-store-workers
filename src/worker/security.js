@@ -5,15 +5,18 @@ const DEFAULT_ALLOWED_ORIGINS = [
 ];
 
 export function getBackendPath(value) {
-    if (
-        typeof value !== 'string' ||
-        value.length < 2 ||
-        !value.startsWith('/') ||
-        value.endsWith('/')
-    ) {
+    if (typeof value !== 'string') {
         return null;
     }
-    return value;
+    const path = value.trim();
+    if (!path) return null;
+    // Secrets are often entered as just the password. Normalize that form so
+    // the Worker and the upstream share-link code use the same URL prefix.
+    const normalized = path.startsWith('/') ? path : `/${path}`;
+    if (normalized === '/' || normalized.endsWith('/') || normalized.includes('?') || normalized.includes('#')) {
+        return null;
+    }
+    return normalized;
 }
 
 export function routeRequest(request, configuredBackendPath) {
