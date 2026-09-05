@@ -1,9 +1,3 @@
-const DEFAULT_ALLOWED_ORIGINS = [
-    'https://sub-store.vercel.app',
-    'http://substore.stash',
-    'https://substore.stash',
-];
-
 export function getBackendPath(value) {
     if (typeof value !== 'string') {
         return null;
@@ -70,18 +64,8 @@ export function routeRequest(request, configuredBackendPath) {
     };
 }
 
-export function isOriginAllowed(request, env) {
-    const origin = request.headers.get('Origin');
-    if (!origin) return true;
-    return getAllowedOrigins(env).has(origin);
-}
-
-export function applyCors(response, request, env) {
-    const origin = request.headers.get('Origin');
-    if (origin && getAllowedOrigins(env).has(origin)) {
-        response.headers.set('Access-Control-Allow-Origin', origin);
-        appendVary(response.headers, 'Origin');
-    }
+export function applyCors(response) {
+    response.headers.set('Access-Control-Allow-Origin', '*');
     response.headers.set(
         'Access-Control-Expose-Headers',
         'Content-Disposition, Profile-Web-Page-Url, Subscription-Userinfo',
@@ -89,19 +73,9 @@ export function applyCors(response, request, env) {
     return response;
 }
 
-export function preflightResponse(request, env) {
-    if (!isOriginAllowed(request, env)) {
-        return jsonResponse(403, {
-            status: 'failed',
-            message: 'CORS origin not allowed',
-        });
-    }
+export function preflightResponse(request) {
     const response = new Response(null, { status: 204 });
-    const origin = request.headers.get('Origin');
-    if (origin) {
-        response.headers.set('Access-Control-Allow-Origin', origin);
-        appendVary(response.headers, 'Origin');
-    }
+    response.headers.set('Access-Control-Allow-Origin', '*');
     response.headers.set(
         'Access-Control-Allow-Methods',
         'DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT',
@@ -119,21 +93,4 @@ export function jsonResponse(status, body) {
         status,
         headers: { 'Content-Type': 'application/json;charset=UTF-8' },
     });
-}
-
-function getAllowedOrigins(env) {
-    const configured = env.SUB_STORE_CORS_ALLOWED_ORIGINS;
-    const origins = configured
-        ? configured.split(',').map((value) => value.trim()).filter(Boolean)
-        : DEFAULT_ALLOWED_ORIGINS;
-    return new Set(origins.filter((origin) => origin !== '*'));
-}
-
-function appendVary(headers, value) {
-    const current = headers.get('Vary');
-    const values = new Set(
-        (current || '').split(',').map((item) => item.trim()).filter(Boolean),
-    );
-    values.add(value);
-    headers.set('Vary', [...values].join(', '));
 }

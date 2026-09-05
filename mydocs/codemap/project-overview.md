@@ -34,7 +34,7 @@
 |---|---|
 | `src/index.js` | **Workers 入口**：绑定校验、路径鉴权、CORS、请求路由、单实例 Durable Object 串行协调、Cron 定时同步 |
 | `src/worker/storage.js` | **存储适配**：首次从旧 KV 导入，SQLite Durable Object 保存权威状态，KV 异步镜像 |
-| `src/worker/security.js` | **安全边界**：路径鉴权、CORS 白名单、预检和统一 JSON 错误响应 |
+| `src/worker/security.js` | **安全边界**：路径鉴权、公开 CORS、预检和统一 JSON 错误响应 |
 | `src/vendor/express.js` | **Express 适配**：将 Workers fetch handler 适配为类 Express 的 req/res 路由 |
 | `src/vendor/open-api.js` | **OpenAPI 适配**：DO Storage 替代 fs 存储、fetch 替代 undici、日志/通知/推送 |
 | `src/core/app.js` | 单例 `$` 导出（`new OpenAPI('sub-store')`） |
@@ -85,7 +85,7 @@ Browser / Client → Worker fetch()
   │   ├─ /backendPath 精确 → 302 重定向
   │   └─ /backendPath/... → 剥离前缀
   │
-  ├─ 校验 Origin；OPTIONS 返回白名单 CORS headers
+  ├─ OPTIONS 返回公开 CORS headers
   │
   └─ SUB_STORE_COORDINATOR.getByName("primary")
       ├─ 请求进入对象内串行队列
@@ -156,7 +156,7 @@ createScriptFunction(script, name)
 - **路径前缀鉴权**：`SUB_STORE_FRONTEND_BACKEND_PATH` 必须配置为 Worker Secret；缺失或格式无效时受保护接口 fail closed。
 - **受保护路径**：管理 `/api/*` 与 `/download/*` 必须带路径前缀。
 - **公开路径**：`/`、`/_health` 和携带有效 token 的 `/share/*`。
-- **CORS**：默认只允许官方前端与 Stash Origin；可用 `SUB_STORE_CORS_ALLOWED_ORIGINS` 配置逗号分隔白名单，不接受通配符 `*`。
+- **CORS**：允许任意前端 Origin，以兼容官方、自建和客户端内嵌前端；CORS 不作为鉴权边界，管理 API 仍必须使用正确的路径 Secret。
 - **路由匹配**：静态和参数路由均为完整路径匹配，未知后缀返回 404。
 - **环境变量最小披露**：前端只看到自定义名称和图标，路径密码与推送 URL 不进入环境接口响应。
 - **Script Operator 沙箱化**：构建期改写 `createDynamicFunction` 为 QuickJS WASM 沙箱执行（内存/栈/指令数限制），避免 `eval`/`new Function`；可用 `SCRIPT_ENGINE=disabled` 关闭。

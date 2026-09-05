@@ -40,7 +40,6 @@ import {
 } from '@/worker/storage';
 import {
     applyCors,
-    isOriginAllowed,
     jsonResponse,
     preflightResponse,
     getBackendPath,
@@ -132,7 +131,7 @@ export default {
 
     async fetch(request, env) {
         const bindingError = validateBindings(env);
-        if (bindingError) return bindingError.response;
+        if (bindingError) return applyCors(bindingError.response);
         return getCoordinator(env).fetch(request);
     },
 };
@@ -146,14 +145,8 @@ async function handleRequest(originalRequest, env, ctx, stateStore) {
         request = routed.request;
         const pathname = routed.pathname;
 
-        if (!isOriginAllowed(request, env)) {
-            return jsonResponse(403, {
-                status: 'failed',
-                message: 'CORS origin not allowed',
-            });
-        }
         if (request.method === 'OPTIONS') {
-            return preflightResponse(request, env);
+            return preflightResponse(request);
         }
 
         await initializeApplication(env, stateStore);

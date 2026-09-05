@@ -35,20 +35,42 @@ describe('Worker security boundary', () => {
         expect(new URL(result.request.url).searchParams.get('share')).toBe('true');
     });
 
-    it('allows only configured browser origins', async () => {
-        const allowed = await SELF.fetch('https://example.com/_health', {
-            headers: { Origin: 'https://sub-store.vercel.app' },
+    it('allows browser requests from any origin', async () => {
+        const response = await SELF.fetch('https://example.com/_health', {
+            headers: { Origin: 'https://frontend.example' },
         });
-        expect(allowed.status).toBe(200);
-        expect(allowed.headers.get('Access-Control-Allow-Origin')).toBe(
-            'https://sub-store.vercel.app',
-        );
+        expect(response.status).toBe(200);
+        expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    });
 
-        const rejected = await SELF.fetch('https://example.com/_health', {
-            headers: { Origin: 'https://attacker.example' },
-        });
-        expect(rejected.status).toBe(403);
-        expect(rejected.headers.has('Access-Control-Allow-Origin')).toBe(false);
+    it('allows preflight requests from any origin', async () => {
+        const response = await SELF.fetch(
+            'https://example.com/test-secret/api/utils/env',
+            {
+                method: 'OPTIONS',
+                headers: {
+                    Origin: 'https://frontend.example',
+                    'Access-Control-Request-Method': 'GET',
+                    'Access-Control-Request-Headers': 'Content-Type',
+                },
+            },
+        );
+        expect(response.status).toBe(204);
+        expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
+        expect(response.headers.get('Access-Control-Allow-Headers')).toBe(
+            'Content-Type',
+        );
+    });
+
+    it('keeps path authentication with public CORS', async () => {
+        const response = await SELF.fetch(
+            'https://example.com/api/utils/env',
+            {
+                headers: { Origin: 'https://frontend.example' },
+            },
+        );
+        expect(response.status).toBe(401);
+        expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
     });
 
     it('does not expose secrets through the environment endpoint', async () => {
